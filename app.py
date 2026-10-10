@@ -252,9 +252,25 @@ def color_active_table(df):
 def fetch_closed_trades_history(exc, piata):
     raw_rows = []
     try:
+        # --- BLOC NOU: Descărcăm istoricul ordinelor pentru a ști EXACT tipul ---
+        order_map = {}
+        try:
+            if hasattr(exc, 'fetch_closed_orders'):
+                # Descărcăm ultimele 1500 de ordine (suficient pentru a prinde tranzacțiile)
+                closed_orders = exc.fetch_closed_orders(limit=1500)
+                for o in closed_orders:
+                    o_id = str(o.get('id', ''))
+                    if o_id:
+                        o_type = str(o.get('type', '')).lower()
+                        o_info_type = str(o.get('info', {}).get('orderType', '')).lower()
+                        order_map[o_id] = f"{o_type} {o_info_type}"
+        except Exception:
+            pass
+        # --------------------------------------------------------------------------
+
         trades_raw = []
         
-        # 1. Extragem datele doar o singură dată ca să evităm dublarea
+        # 1. Extragem execuțiile (fills)
         fetched_standard = False
         if hasattr(exc, 'fetch_my_trades'):
             try: 
@@ -306,27 +322,40 @@ def fetch_closed_trades_history(exc, piata):
             raw_side = str(t.get('side') or info.get('side') or 'N/A').lower()
             direcție = "LONG" if raw_side == "buy" else ("SHORT" if raw_side == "sell" else raw_side.upper())
             
+            order_id = str(t.get('order') or info.get('order_id') or info.get('orderId') or f"{data_ora_minut}_{simbol_curat}_{direcție}")
+            
+            # --- EVALUARE EXECUTIE FOLOSIND BAZA DE DATE A ORDINELOR ---
+            tip_ordin_din_map = order_map.get(order_id, "").lower()
             order_type_raw = str(info.get('type') or info.get('orderType') or t.get('type') or '').lower()
             order_reason = str(info.get('reason') or info.get('reduceOnly') or '').lower()
             
+            # Combinăm ce știm din interogarea directă a ordinelor cu ce știm din execuție
+            tot_text = f"{order_type_raw} {order_reason} {tip_ordin_din_map}"
+            
+            if 'trailing' in tot_text:
+                exec_detaliat = "TRAILING STOP"
+            elif 'stop' in tot_text or 'stp' in tot_text:
+                exec_detaliat = "STOP LOSS"
+            elif 'take' in tot_text or 'profit' in tot_text or 'target' in tot_text:
+                exec_detaliat = "TAKE PROFIT"
+            elif 'limit' in tot_text or 'lmt' in tot_text or 'post' in tot_text:
+                if raw_side == "sell":
+                    exec_detaliat = "SELL LIMIT"
+                elif raw_side == "buy":
+                    exec_detaliat = "BUY LIMIT"
+                else:
+                    exec_detaliat = "LIMIT"
+            else:
+                # Orice vine pur ca piață, lichidare rapidă manuală sau unde nu găsim un tip atașat
+                exec_detaliat = "MANUAL"
+            # -------------------------------------------------------------
+
             pnl_val = safe_float(
                 info.get('realisedPnl') or info.get('realizedPnl') or 
                 info.get('realised_pnl') or info.get('realized_pnl') or 
                 info.get('pnl') or t.get('pnl') or 0
             )
             
-            # Etichetare mai bună pentru execuții
-            if 'stop' in order_type_raw or 'stop' in order_reason or 'trigger' in order_reason:
-                exec_detaliat = "STOP LOSS"
-            elif 'take' in order_type_raw or 'profit' in order_type_raw or 'target' in order_reason:
-                exec_detaliat = "TAKE PROFIT"
-            elif 'limit' in order_type_raw:
-                exec_detaliat = "LIMIT"
-            elif 'market' in order_type_raw or 'ioc' in order_type_raw:
-                exec_detaliat = "MARKET"
-            else:
-                exec_detaliat = "MANUAL"
-
             pret = safe_float(
                 t.get('price') or info.get('price') or 
                 info.get('fillPrice') or info.get('executionPrice') or 0
@@ -342,9 +371,6 @@ def fetch_closed_trades_history(exc, piata):
                     sort_ts = sort_ts / 1000.0
             except:
                 sort_ts = 0.0
-
-            # 4. Cheia de grupare devine ID-ul Ordinului (pentru a însuma execuțiile parțiale) 
-            order_id = str(t.get('order') or info.get('order_id') or info.get('orderId') or f"{data_ora_minut}_{simbol_curat}_{direcție}")
 
             if cantitate > 0:
                 raw_rows.append({
