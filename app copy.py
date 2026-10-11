@@ -252,9 +252,20 @@ def color_active_table(df):
 def fetch_closed_trades_history(exc, piata):
     raw_rows = []
     try:
+        order_map = {}
+        try:
+            if hasattr(exc, 'fetch_closed_orders'):
+                closed_orders = exc.fetch_closed_orders(limit=1500)
+                for o in closed_orders:
+                    o_id = str(o.get('id', ''))
+                    if o_id:
+                        o_type = str(o.get('type', '')).lower()
+                        o_info_type = str(o.get('info', {}).get('orderType', '')).lower()
+                        order_map[o_id] = f"{o_type} {o_info_type}"
+        except Exception:
+            pass
+
         trades_raw = []
-        
-        # 1. Extragem datele doar o singură dată ca să evităm dublarea
         fetched_standard = False
         if hasattr(exc, 'fetch_my_trades'):
             try: 
@@ -282,7 +293,6 @@ def fetch_closed_trades_history(exc, piata):
                         })
             except Exception: pass
 
-        # 2. Eliminăm duplicatele folosind ID-ul exact al execuției (trade/fill ID)
         unique_trades = {}
         for t in trades_raw:
             info = t.get('info', {}) or {}
@@ -291,7 +301,6 @@ def fetch_closed_trades_history(exc, piata):
             
         trades_curate = list(unique_trades.values())
 
-        # 3. Procesăm doar tranzacțiile unice
         for t in trades_curate:
             if not t or not isinstance(t, dict): continue
                 
@@ -306,39 +315,36 @@ def fetch_closed_trades_history(exc, piata):
             raw_side = str(t.get('side') or info.get('side') or 'N/A').lower()
             direcție = "LONG" if raw_side == "buy" else ("SHORT" if raw_side == "sell" else raw_side.upper())
             
+            order_id = str(t.get('order') or info.get('order_id') or info.get('orderId') or f"{data_ora_minut}_{simbol_curat}_{direcție}")
+            
+            tip_ordin_din_map = order_map.get(order_id, "").lower()
             order_type_raw = str(info.get('type') or info.get('orderType') or t.get('type') or '').lower()
             order_reason = str(info.get('reason') or info.get('reduceOnly') or '').lower()
             
-            pnl_val = safe_float(
-                info.get('realisedPnl') or info.get('realizedPnl') or 
-                info.get('realised_pnl') or info.get('realized_pnl') or 
-                info.get('pnl') or t.get('pnl') or 0
-            )
+            tot_text = f"{order_type_raw} {order_reason} {tip_ordin_din_map}"
             
-            # --- START LOGICA ACTUALIZATA PENTRU EXECUTIE ---
-            # Mapare precisă în funcție de tipul și scopul ordinului
-            
-            if 'stop' in order_type_raw or 'stop' in order_reason or 'trigger' in order_reason:
-                if 'trailing' in order_type_raw:
-                    exec_detaliat = "TRAILING STOP"
-                else:
-                    exec_detaliat = "STOP LOSS"
-            elif 'take' in order_type_raw or 'profit' in order_type_raw or 'target' in order_reason:
+            if 'trailing' in tot_text:
+                exec_detaliat = "TRAILING STOP"
+            elif 'stop' in tot_text or 'stp' in tot_text:
+                exec_detaliat = "STOP LOSS"
+            elif 'take' in tot_text or 'profit' in tot_text or 'target' in tot_text:
                 exec_detaliat = "TAKE PROFIT"
-            elif 'limit' in order_type_raw:
-                # Dacă e un ordin Limit pur, îi adăugăm direcția (BUY LIMIT / SELL LIMIT)
+            elif 'limit' in tot_text or 'lmt' in tot_text or 'post' in tot_text:
                 if raw_side == "sell":
                     exec_detaliat = "SELL LIMIT"
                 elif raw_side == "buy":
                     exec_detaliat = "BUY LIMIT"
                 else:
                     exec_detaliat = "LIMIT"
-            elif 'market' in order_type_raw or 'ioc' in order_type_raw:
-                exec_detaliat = "MANUAL"
             else:
                 exec_detaliat = "MANUAL"
-            # --- END LOGICA ACTUALIZATA ---
 
+            pnl_val = safe_float(
+                info.get('realisedPnl') or info.get('realizedPnl') or 
+                info.get('realised_pnl') or info.get('realized_pnl') or 
+                info.get('pnl') or t.get('pnl') or 0
+            )
+            
             pret = safe_float(
                 t.get('price') or info.get('price') or 
                 info.get('fillPrice') or info.get('executionPrice') or 0
@@ -354,9 +360,6 @@ def fetch_closed_trades_history(exc, piata):
                     sort_ts = sort_ts / 1000.0
             except:
                 sort_ts = 0.0
-
-            # 4. Cheia de grupare devine ID-ul Ordinului (pentru a însuma execuțiile parțiale) 
-            order_id = str(t.get('order') or info.get('order_id') or info.get('orderId') or f"{data_ora_minut}_{simbol_curat}_{direcție}")
 
             if cantitate > 0:
                 raw_rows.append({
@@ -391,8 +394,12 @@ def fetch_closed_trades_history(exc, piata):
             grup_sortat = grup.sort_values(by="sort_timestamp", ascending=False)
             first_row = grup_sortat.iloc[0]
             
+            # --- BLOC NOU: Determinare Status Open / Closed ---
+            status_val = "OPEN" if pnl_total == 0.0 else "CLOSED"
+            
             aggregated_data.append({
                 "sort_timestamp": first_row["sort_timestamp"],
+                "Status": status_val,
                 "Data & Ora": first_row["Data & Ora"],
                 "Simbol": first_row["Simbol"],
                 "Tip": first_row["Tip"],
@@ -429,10 +436,18 @@ def color_trade_table(df):
 
     def highlight_closing_rows(row):
         try:
-            pnl = safe_float(row['PnL'])
-            if pnl != 0.0: return ['background-color: rgba(77, 163, 255, 0.12);'] * len(row)
+            status = str(row.get('Status', ''))
+            if status == "CLOSED":
+                return ['background-color: rgba(77, 163, 255, 0.12);'] * len(row)
+            elif status == "OPEN":
+                return ['background-color: rgba(255, 165, 0, 0.12);'] * len(row)
         except: pass
         return [''] * len(row)
+
+    def highlight_status(val):
+        if val == "OPEN": return 'color: #ffa500; font-weight: bold;'
+        elif val == "CLOSED": return 'color: #4da3ff; font-weight: bold;'
+        return ''
 
     def highlight_tip(val):
         if val == "LONG": return 'color: #28a745; font-weight: bold;'
@@ -457,6 +472,8 @@ def color_trade_table(df):
 
     styled = df_viz.style.apply(highlight_closing_rows, axis=1)
     
+    if "Status" in df_viz.columns:
+        styled = styled.map(highlight_status, subset=['Status'])
     styled = styled.map(highlight_tip, subset=['Tip'])
     if "PnL" in df_viz.columns:
         styled = styled.map(highlight_pnl, subset=['PnL'])
@@ -541,6 +558,7 @@ if exchange:
                         df_csv = df_csv.drop(columns=['Comision_Val'])
                     
                     total_row = pd.DataFrame([{
+                        "Status": "",
                         "Data & Ora": "TOTAL",
                         "Simbol": "",
                         "Tip": "",
