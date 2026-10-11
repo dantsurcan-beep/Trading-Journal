@@ -13,6 +13,21 @@ except ImportError:
 st.set_page_config(page_title="Kraken Universal Trading Journal", layout="wide")
 
 custom_css = """
+<style>
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 1rem;
+    }
+    h3 {
+        margin-bottom: 0.5rem !important;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.25rem !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.85rem !important;
+    }
+</style>
 """
 st.markdown(custom_css, unsafe_allow_html=True)
 
@@ -193,58 +208,17 @@ def color_active_table(df):
             else: return 'color: #6c757d;' 
         except: return ''
 
-    def highlight_simbol(val): return 'color: #00e676; font-weight: bold;'
-    def highlight_date(val): return 'color: #4da3ff;'
-    def highlight_gold(val): return 'color: #ffc107;'
-    def highlight_purple(val): return 'color: #b19cd9;'
-    def highlight_teal(val): return 'color: #20c997;'
-    def highlight_orange(val): return 'color: #ffa500; font-weight: bold;'
-
     styled = df.style.map(highlight_tip, subset=['Direcție'])
     if "PnL" in df.columns:
         styled = styled.map(highlight_pnl, subset=['PnL'])
-    if "Data Preluării" in df.columns:
-        styled = styled.map(highlight_date, subset=['Data Preluării'])
-    if "Simbol" in df.columns:
-        styled = styled.map(highlight_simbol, subset=['Simbol'])
-    if "Preț Intrare" in df.columns:
-        styled = styled.map(highlight_gold, subset=['Preț Intrare'])
-    if "Stop Loss" in df.columns:
-        styled = styled.map(highlight_gold, subset=['Stop Loss'])
-    if "Take Profit" in df.columns:
-        styled = styled.map(highlight_gold, subset=['Take Profit'])
-    if "Limit" in df.columns:
-        styled = styled.map(highlight_gold, subset=['Limit'])
-    if "Cantitate" in df.columns:
-        styled = styled.map(highlight_purple, subset=['Cantitate'])
-    if "Valoare" in df.columns:
-        styled = styled.map(highlight_teal, subset=['Valoare'])
-    if "Trailing" in df.columns:
-        styled = styled.map(highlight_orange, subset=['Trailing'])
-
-    def format_pnl(val):
-        try:
-            num = safe_float(val)
-            if num == 0: return "$0.00"
-            return f"${num:+,.2f}"
-        except:
-            return "$0.00"
-
-    def format_price(val):
-        try:
-            num = safe_float(val)
-            if num <= 0: return "-"
-            return f"${num:,.2f}"
-        except:
-            return "-"
 
     formats = {
         "Preț Intrare": "${:,.2f}",
         "Valoare": "${:,.2f}",
-        "Stop Loss": format_price,
-        "Take Profit": format_price,
-        "Limit": format_price,
-        "PnL": format_pnl
+        "Stop Loss": lambda x: f"${x:,.2f}" if safe_float(x) > 0 else "-",
+        "Take Profit": lambda x: f"${x:,.2f}" if safe_float(x) > 0 else "-",
+        "Limit": lambda x: f"${x:,.2f}" if safe_float(x) > 0 else "-",
+        "PnL": lambda x: f"${safe_float(x):+,.2f}" if safe_float(x) != 0 else "$0.00"
     }
 
     return styled.format(formats)
@@ -394,7 +368,6 @@ def fetch_closed_trades_history(exc, piata):
             grup_sortat = grup.sort_values(by="sort_timestamp", ascending=False)
             first_row = grup_sortat.iloc[0]
             
-            # --- BLOC NOU: Determinare Status Open / Closed ---
             status_val = "OPEN" if pnl_total == 0.0 else "CLOSED"
             
             aggregated_data.append({
@@ -416,7 +389,7 @@ def fetch_closed_trades_history(exc, piata):
         
         if not df_final.empty:
             df_final['PnL'] = pd.to_numeric(df_final['PnL'], errors='coerce').fillna(0.0)
-            df_final = df_final.sort_values(by="sort_timestamp", ascending=False).drop(columns=["sort_timestamp"])
+            df_final = df_final.sort_values(by="sort_timestamp", ascending=False)
             
         return df_final
         
@@ -431,6 +404,8 @@ def color_trade_table(df):
     df_viz = df.copy()
     if 'Comision_Val' in df_viz.columns:
         df_viz = df_viz.drop(columns=['Comision_Val'])
+    if 'sort_timestamp' in df_viz.columns:
+        df_viz = df_viz.drop(columns=['sort_timestamp'])
 
     df_viz['PnL'] = pd.to_numeric(df_viz['PnL'], errors='coerce').fillna(0.0)
 
@@ -507,13 +482,13 @@ def color_trade_table(df):
     })
 
 if exchange:
-    tab1, tab2 = st.tabs(["📌 Poziții Active Live", "📜 Istoricul Universal (Preluat Automat)"])
+    tab1, tab2 = st.tabs(["📌 Poziții Active", "📜 Istoricul Universal"])
     
     with tab1:
         st.subheader("Monitorizare în timp real")
         df_active = fetch_active_positions(exchange, piata_ales)
         if not df_active.empty:
-            st.dataframe(color_active_table(df_active), use_container_width=True, height=300, hide_index=True, column_config={
+            st.dataframe(color_active_table(df_active), use_container_width=True, height=280, hide_index=True, column_config={
                 "PnL": st.column_config.NumberColumn("PnL", width="small")
             })
         else:
@@ -523,6 +498,42 @@ if exchange:
         df_istoric = fetch_closed_trades_history(exchange, piata_ales)
         if not df_istoric.empty:
             
+            # --- CALCULATOR PNL NET PE PERIOADĂ ---
+            with st.container():
+                st.markdown("#### 🧮 Calculator PnL Net & Comisioane per Interval")
+                calc_col1, calc_col2, calc_col3 = st.columns(3)
+                
+                with calc_col1:
+                    calc_start = st.date_input("Data de început", value=date.today() - timedelta(days=7), key="calc_start")
+                with calc_col2:
+                    calc_end = st.date_input("Data de sfârșit", value=date.today(), key="calc_end")
+                
+                df_calc = df_istoric.copy()
+                df_calc['temp_date'] = pd.to_datetime(df_calc['Data & Ora'], format='%d-%m-%Y %H:%M', errors='coerce').dt.date
+                df_filtered_calc = df_calc[(df_calc['temp_date'] >= calc_start) & (df_calc['temp_date'] <= calc_end)]
+                
+                sum_pnl_brut = df_filtered_calc['PnL'].sum() if not df_filtered_calc.empty else 0.0
+                sum_comisioane = df_filtered_calc['Comision_Val'].sum() if not df_filtered_calc.empty and 'Comision_Val' in df_filtered_calc.columns else 0.0
+                pnl_net = sum_pnl_brut - sum_comisioane
+                
+                with calc_col3:
+                    st.markdown(f"**Total Tranzacții în interval:** `{len(df_filtered_calc)}`")
+                
+                mcol1, mcol2, mcol3 = st.columns(3)
+                mcol1.metric("PnL Brut", f"${sum_pnl_brut:+,.2f}")
+                mcol2.metric("Total Comisioane", f"${sum_comisioane:,.4f}")
+                
+                net_color_style = "color: #28a745;" if pnl_net >= 0 else "color: #fd7e14;"
+                mcol3.markdown(f"""
+                    <div style="background-color: #1e222d; padding: 8px 12px; border-radius: 5px; border: 1px solid #2a2e39;">
+                        <span style="font-size: 0.8rem; color: #a6b0cf;">PnL Net (După Comisioane)</span><br>
+                        <span style="font-size: 1.25rem; font-weight: bold; {net_color_style}">${pnl_net:+,.2f}</span>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # --- OPȚIUNI EXPORT ---
             with st.expander("📥 Opțiuni Export Personalizat (Google Sheets)", expanded=False):
                 col_exp1, col_exp2, col_exp3 = st.columns(3)
                 
@@ -539,9 +550,9 @@ if exchange:
                     
                 elif filtru_perioada == "Interval personalizat":
                     with col_exp2:
-                        start_date = st.date_input("De la data", value=date.today() - timedelta(days=7))
+                        start_date = st.date_input("De la", value=date.today() - timedelta(days=7), key="exp_start")
                     with col_exp3:
-                        end_date = st.date_input("Până la data", value=date.today())
+                        end_date = st.date_input("Până la", value=date.today(), key="exp_end")
                     
                     df_export_filtered['temp_dt'] = pd.to_datetime(df_export_filtered['Data & Ora'], format='%d-%m-%Y %H:%M', errors='coerce').dt.date
                     df_export_filtered = df_export_filtered[(df_export_filtered['temp_dt'] >= start_date) & (df_export_filtered['temp_dt'] <= end_date)]
@@ -549,6 +560,8 @@ if exchange:
 
                 if not df_export_filtered.empty:
                     df_csv = df_export_filtered.copy()
+                    if 'sort_timestamp' in df_csv.columns:
+                        df_csv = df_csv.drop(columns=['sort_timestamp'])
                     
                     sum_valoare = df_csv['Valoare'].sum()
                     sum_pnl = df_csv['PnL'].sum()
@@ -585,8 +598,10 @@ if exchange:
             df_display = df_istoric.copy()
             if 'Comision_Val' in df_display.columns:
                 df_display = df_display.drop(columns=['Comision_Val'])
+            if 'sort_timestamp' in df_display.columns:
+                df_display = df_display.drop(columns=['sort_timestamp'])
                 
-            st.dataframe(color_trade_table(df_display), use_container_width=True, height=520, hide_index=True)
+            st.dataframe(color_trade_table(df_display), use_container_width=True, height=480, hide_index=True)
             
         else:
             st.info("Nu s-au găsit tranzacții închise în istoric.")
