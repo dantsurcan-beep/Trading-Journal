@@ -254,7 +254,7 @@ def color_active_table(df):
         try:
             num = safe_float(val)
             if num > 0: return 'color: #28a745; font-weight: bold; font-size: 1.1em;'
-            elif num < 0: return 'color: #dc3545; font-weight: bold; font-size: 1.1em;'
+            elif num < 0: return 'color: #ff3333; font-weight: bold; font-size: 1.1em;'
             else: return 'color: #6c757d;'
         except Exception:
             return ''
@@ -575,7 +575,7 @@ def color_trade_table(df):
 
     def highlight_tip(val):
         if val == "LONG": return 'color: #28a745; font-weight: bold;'
-        elif val == "SHORT": return 'color: #dc3545; font-weight: bold;'
+        elif val == "SHORT": return 'color: #ff3333; font-weight: bold;'
         return ''
 
     def highlight_pnl(val):
@@ -627,7 +627,7 @@ if exchange:
                 if not df_active.empty:
                     st.dataframe(
                         color_active_table(df_active),
-                        use_container_width=True,
+                        width="stretch",
                         height=300,
                         hide_index=True
                     )
@@ -648,8 +648,6 @@ if exchange:
             min_date_avail = df_istoric['temp_dt'].dropna().min() or date(2026, 9, 20)
             max_date_avail = df_istoric['temp_dt'].dropna().max() or date.today()
 
-            # --- RÂNDUL 1: Filtre lărgite ---
-            # Format custom DD/MM/YYYY
             col_d1, col_d2, col_sym, col_dir = st.columns([1.2, 1.2, 2.5, 1.5])
 
             with col_d1:
@@ -662,7 +660,6 @@ if exchange:
             with col_dir:
                 sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"])
 
-            # --- Aplicare filtre ---
             df_filtrat = df_istoric[
                 (df_istoric['temp_dt'] >= sel_start_date) &
                 (df_istoric['temp_dt'] <= sel_end_date) &
@@ -681,11 +678,9 @@ if exchange:
 
             st.markdown("<br>", unsafe_allow_html=True)
             
-            # --- RÂNDUL 2: PnL Custom Colorat + Mini Tabel KPI ---
             col_pnl_box, col_kpi_table = st.columns([1.5, 3])
 
             with col_pnl_box:
-                # Custom HTML box pentru culori stricte: Verde sau Roșu clar
                 bg_color = "rgba(40, 167, 69, 0.15)" if total_pnl >= 0 else "rgba(255, 51, 51, 0.15)"
                 text_color = "#00e676" if total_pnl >= 0 else "#ff3333"
                 sign = "+" if total_pnl >= 0 else ""
@@ -698,7 +693,6 @@ if exchange:
                 """, unsafe_allow_html=True)
 
             with col_kpi_table:
-                # HTML Tabel Compact pentru KPI-uri
                 def color_val(val, is_currency=True, neutral=False):
                     if neutral: return f"<span style='color: #ffc107;'>{val}</span>"
                     if is_currency:
@@ -727,15 +721,17 @@ if exchange:
                 """, unsafe_allow_html=True)
 
 
-            # === RÂNDUL 3: GRAFIC EQUITY CURVE & OPȚIUNI EXPORT CSV ===
             st.markdown("<br>", unsafe_allow_html=True)
             col_exp_chart, col_exp_csv = st.columns(2)
+            
             with col_exp_chart:
                 with st.expander("📈 Grafic Evoluție PnL Cumulat (Equity Curve)", expanded=False):
                     if not trades_inchise.empty:
                         df_chart = trades_inchise.iloc[::-1].copy()
+                        # REZOLVARE EROARE GRAFIC: Conversie string în Datetime strict pentru axa de timp
+                        df_chart['Timp_Fix'] = pd.to_datetime(df_chart['Data & Ora'], format='%d-%m-%Y %H:%M')
                         df_chart['PnL Cumulat ($)'] = df_chart['PnL'].cumsum()
-                        st.line_chart(df_chart, x='Data & Ora', y='PnL Cumulat ($)', color="#00e676")
+                        st.line_chart(df_chart, x='Timp_Fix', y='PnL Cumulat ($)', color="#00e676")
                     else:
                         st.info("Nu există tranzacții închise în intervalul selectat.")
 
@@ -772,12 +768,11 @@ if exchange:
 
             st.markdown("---")
             
-            # --- TABELUL FINAL ---
             df_display = df_filtrat.copy()
             if 'Comision_Val' in df_display.columns:
                 df_display = df_display.drop(columns=['Comision_Val'])
                 
-            st.dataframe(color_trade_table(df_display), use_container_width=True, height=540, hide_index=True)
+            st.dataframe(color_trade_table(df_display), width="stretch", height=540, hide_index=True)
             
         else:
             st.info("Nu s-au găsit tranzacții închise în istoric.")
