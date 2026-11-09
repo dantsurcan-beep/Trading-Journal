@@ -81,7 +81,6 @@ def safe_float(val, default=0.0):
 
 
 def get_ts_ms(raw_ts):
-    """Convertește orice format de dată/timestamp în milisecunde UTC."""
     if not raw_ts:
         return 0
     try:
@@ -100,7 +99,6 @@ def get_ts_ms(raw_ts):
 
 
 def to_iso_utc(ts_ms):
-    """Convertește milisecunde în format ISO 8601 UTC cerut de Kraken Futures."""
     dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
@@ -303,7 +301,6 @@ def color_active_table(df):
 def fetch_closed_trades_history(_exc, piata):
     raw_rows = []
     try:
-        # Pragul dorit: 20 Septembrie 2026, 00:00:00 UTC
         start_date_dt = datetime(2026, 9, 20, 0, 0, 0, tzinfo=timezone.utc)
         since_timestamp = int(start_date_dt.timestamp() * 1000)
 
@@ -323,10 +320,8 @@ def fetch_closed_trades_history(_exc, piata):
         trades_raw = []
 
         if piata == "Futures":
-            # Kraken Futures returnează max 100 fills per apel, de la cel mai nou spre cel mai vechi.
-            # Paginăm ÎNAPOI în timp folosind parametrul 'lastFillTime' până trecem de 20 septembrie 2026.
             last_fill_time_param = None
-            for _ in range(60):  # Până la 6.000 de execuții istorice
+            for _ in range(60):
                 params = {'lastFillTime': last_fill_time_param} if last_fill_time_param else {}
                 batch = []
                 
@@ -356,7 +351,6 @@ def fetch_closed_trades_history(_exc, piata):
 
                 trades_raw.extend(batch)
 
-                # Căutăm cel mai vechi timestamp din pachetul curent
                 oldest_ts_ms = None
                 oldest_iso_str = None
                 for item in batch:
@@ -369,8 +363,6 @@ def fetch_closed_trades_history(_exc, piata):
 
                 if oldest_ts_ms is None:
                     break
-
-                # Ne oprim când am coborât înainte de 18 septembrie 2026 (lăsăm 2 zile marjă pt poziții deschise)
                 if oldest_ts_ms < (since_timestamp - 2 * 86400 * 1000):
                     break
 
@@ -379,7 +371,6 @@ def fetch_closed_trades_history(_exc, piata):
                     next_param = to_iso_utc(oldest_ts_ms - 1)
                 last_fill_time_param = next_param
         else:
-            # Paginare Kraken Spot
             curr_since = since_timestamp
             for _ in range(20):
                 try:
@@ -463,7 +454,6 @@ def fetch_closed_trades_history(_exc, piata):
             if comision_api > 0:
                 comision = comision_api
             else:
-                # Pe Kraken Futures: 0.02% Maker / 0.05% Taker
                 fee_rate = 0.0002 if 'maker' in fill_type else 0.0005
                 comision = valoare_fill * fee_rate
 
@@ -514,7 +504,6 @@ def fetch_closed_trades_history(_exc, piata):
                 "PnL_API": pnl_total
             })
 
-        # Sortăm mai întâi CRONOLOGIC (de la vechi la nou) pentru a calcula exact PnL-ul la închiderea pozițiilor
         aggregated_data.sort(key=lambda x: x["sort_timestamp"])
         open_positions = {}
 
@@ -550,7 +539,6 @@ def fetch_closed_trades_history(_exc, piata):
             row["PnL"] = row["PnL_API"] if abs(row["PnL_API"]) > 1e-9 else round(calc_pnl, 2)
             del row["PnL_API"]
 
-        # Păstrăm doar tranzacțiile începând cu 20 Septembrie 2026
         cutoff_sec = since_timestamp / 1000.0
         aggregated_data = [r for r in aggregated_data if r["sort_timestamp"] >= cutoff_sec]
 
@@ -558,7 +546,6 @@ def fetch_closed_trades_history(_exc, piata):
         
         if not df_final.empty:
             df_final['PnL'] = pd.to_numeric(df_final['PnL'], errors='coerce').fillna(0.0)
-            # SORTARE FINALĂ DESCRESCĂTOARE: Ultima tranzacție încheiată este PRIMA SUS, iar 20 septembrie este JOS
             df_final = df_final.sort_values(by="sort_timestamp", ascending=False).drop(columns=["sort_timestamp"]).reset_index(drop=True)
             
         return df_final
@@ -595,7 +582,7 @@ def color_trade_table(df):
         try:
             num = safe_float(val)
             if num > 0: return 'color: #28a745; font-weight: bold; font-size: 1.1em;'
-            elif num < 0: return 'color: #fd7e14; font-weight: bold; font-size: 1.1em;'
+            elif num < 0: return 'color: #ff3333; font-weight: bold; font-size: 1.1em;'
             else: return 'color: #6c757d;'
         except Exception:
             return ''
@@ -661,20 +648,21 @@ if exchange:
             min_date_avail = df_istoric['temp_dt'].dropna().min() or date(2026, 9, 20)
             max_date_avail = df_istoric['temp_dt'].dropna().max() or date.today()
 
-            # === RÂNDUL PRINCIPAL: PNL TOTAL CUMULAT + SELECTOR DE PERIOADĂ ȘI FILTRE ÎN DREAPTA ===
-            col_pnl_box, col_d1, col_d2, col_sym, col_dir = st.columns([2.2, 1, 1, 1.3, 1.1])
+            # --- RÂNDUL 1: Filtre lărgite ---
+            # Format custom DD/MM/YYYY
+            col_d1, col_d2, col_sym, col_dir = st.columns([1.2, 1.2, 2.5, 1.5])
 
             with col_d1:
-                sel_start_date = st.date_input("🗓️ De la data", value=min_date_avail, min_value=date(2026, 9, 1), max_value=max_date_avail)
+                sel_start_date = st.date_input("🗓️ De la (ZZ/LL/AAAA)", value=min_date_avail, min_value=date(2026, 9, 1), max_value=max_date_avail, format="DD/MM/YYYY")
             with col_d2:
-                sel_end_date = st.date_input("🗓️ Până la data", value=max_date_avail, min_value=date(2026, 9, 1), max_value=date.today())
+                sel_end_date = st.date_input("🗓️ Până la (ZZ/LL/AAAA)", value=max_date_avail, min_value=date(2026, 9, 1), max_value=date.today(), format="DD/MM/YYYY")
             with col_sym:
                 lista_simboluri = sorted(df_istoric['Simbol'].dropna().unique().tolist())
                 sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=lista_simboluri)
             with col_dir:
                 sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"])
 
-            # Filtrăm tabelul conform perioadei și filtrelor selectate
+            # --- Aplicare filtre ---
             df_filtrat = df_istoric[
                 (df_istoric['temp_dt'] >= sel_start_date) &
                 (df_istoric['temp_dt'] <= sel_end_date) &
@@ -691,21 +679,56 @@ if exchange:
             best_trade = trades_inchise['PnL'].max() if nr_inchise > 0 else 0.0
             worst_trade = trades_inchise['PnL'].min() if nr_inchise > 0 else 0.0
 
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # --- RÂNDUL 2: PnL Custom Colorat + Mini Tabel KPI ---
+            col_pnl_box, col_kpi_table = st.columns([1.5, 3])
+
             with col_pnl_box:
-                if total_pnl >= 0:
-                    st.success(f"### 📈 PnL Total Cumulat: +${total_pnl:,.2f}")
-                else:
-                    st.error(f"### 📉 PnL Total Cumulat: -${abs(total_pnl):,.2f}")
+                # Custom HTML box pentru culori stricte: Verde sau Roșu clar
+                bg_color = "rgba(40, 167, 69, 0.15)" if total_pnl >= 0 else "rgba(255, 51, 51, 0.15)"
+                text_color = "#00e676" if total_pnl >= 0 else "#ff3333"
+                sign = "+" if total_pnl >= 0 else ""
+                
+                st.markdown(f"""
+                <div style="background-color: {bg_color}; border: 1px solid {text_color}; border-radius: 8px; padding: 15px; text-align: center;">
+                    <h3 style="margin: 0; color: #ffffff; font-size: 1.2rem;">PnL Total Cumulat</h3>
+                    <h2 style="margin: 5px 0 0 0; color: {text_color}; font-size: 2.2rem;">{sign}${total_pnl:,.2f}</h2>
+                </div>
+                """, unsafe_allow_html=True)
 
-            # === CARDURI KPI PENTRU PERIOADA SELECTATĂ ===
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("Tranzacții (Închise / Total)", f"{nr_inchise} / {len(df_filtrat)}")
-            k2.metric("Win Rate", f"{win_rate:.1f}%")
-            k3.metric("Comision Total Perioadă", f"${total_comision:,.2f}")
-            k4.metric("Cel mai bun Trade", f"+${best_trade:,.2f}" if best_trade >= 0 else f"${best_trade:,.2f}")
-            k5.metric("Cel mai slab Trade", f"${worst_trade:,.2f}")
+            with col_kpi_table:
+                # HTML Tabel Compact pentru KPI-uri
+                def color_val(val, is_currency=True, neutral=False):
+                    if neutral: return f"<span style='color: #ffc107;'>{val}</span>"
+                    if is_currency:
+                        if val > 0: return f"<span style='color: #00e676;'>+${val:,.2f}</span>"
+                        elif val < 0: return f"<span style='color: #ff3333;'>-${abs(val):,.2f}</span>"
+                        else: return "<span style='color: #6c757d;'>$0.00</span>"
+                    return val
 
-            # === GRAFIC EQUITY CURVE & OPȚIUNI EXPORT CSV ===
+                st.markdown(f"""
+                <table style="width: 100%; text-align: center; border-collapse: collapse; font-size: 1rem; margin-top: 5px;">
+                    <tr>
+                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Tranzacții (Închise/Total)</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Win Rate</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Comision Perioadă</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai bun Trade</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai slab Trade</th>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; font-weight: bold;">{color_val(f'{nr_inchise} / {len(df_filtrat)}', is_currency=False, neutral=True)}</td>
+                        <td style="padding: 10px; font-weight: bold;">{color_val(f'{win_rate:.1f}%', is_currency=False, neutral=True)}</td>
+                        <td style="padding: 10px; font-weight: bold; color: #ff8c94;">${total_comision:,.2f}</td>
+                        <td style="padding: 10px; font-weight: bold;">{color_val(best_trade)}</td>
+                        <td style="padding: 10px; font-weight: bold;">{color_val(worst_trade)}</td>
+                    </tr>
+                </table>
+                """, unsafe_allow_html=True)
+
+
+            # === RÂNDUL 3: GRAFIC EQUITY CURVE & OPȚIUNI EXPORT CSV ===
+            st.markdown("<br>", unsafe_allow_html=True)
             col_exp_chart, col_exp_csv = st.columns(2)
             with col_exp_chart:
                 with st.expander("📈 Grafic Evoluție PnL Cumulat (Equity Curve)", expanded=False):
@@ -726,7 +749,7 @@ if exchange:
                         if 'Comision_Val' in df_csv.columns:
                             df_csv = df_csv.drop(columns=['Comision_Val'])
                         total_row = pd.DataFrame([{
-                            "Data & Ora": "TOTAL PERIOADĂ SELECTATĂ",
+                            "Data & Ora": "TOTAL PERIOADĂ",
                             "Simbol": "",
                             "Tip": "",
                             "Preț Execuție": "",
@@ -745,10 +768,11 @@ if exchange:
                             mime="text/csv",
                         )
                     else:
-                        st.warning("Nu există date în intervalul selectat pentru export.")
+                        st.warning("Nu există date în intervalul selectat.")
 
             st.markdown("---")
             
+            # --- TABELUL FINAL ---
             df_display = df_filtrat.copy()
             if 'Comision_Val' in df_display.columns:
                 df_display = df_display.drop(columns=['Comision_Val'])
