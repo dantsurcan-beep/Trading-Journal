@@ -16,7 +16,6 @@ st.set_page_config(page_title="Kraken Universal Trading Journal", layout="wide")
 
 st.markdown("### 📊 Jurnal Universal de Trading (Kraken)")
 
-# Fișier de cache în afara folderului Git (pentru a memora cheile în siguranță fără a le urca pe GitHub)
 KEYS_CACHE_FILE = os.path.expanduser("~/.kraken_journal_keys.json")
 
 
@@ -47,7 +46,6 @@ with st.sidebar:
     default_key = ""
     default_secret = ""
     
-    # 1. Încearcă citirea din Streamlit Secrets (Cloud sau local .streamlit/secrets.toml)
     try:
         if piata_ales == "Futures":
             default_key = st.secrets.get("KRAKEN_FUTURES_KEY", "")
@@ -58,7 +56,6 @@ with st.sidebar:
     except Exception:
         pass
 
-    # 2. Dacă nu există în Secrets, încarcă din fișierul memorat automat
     if not default_key or not default_secret:
         cached = load_cached_keys().get(piata_ales, {})
         default_key = default_key or cached.get("key", "")
@@ -668,69 +665,49 @@ def render_boxed_trades_html(df):
     css = """
 <style>
 .jurnal-scroll-box {
-max-height: 620px;
+max-height: 640px;
 overflow-y: auto;
+overflow-x: hidden;
 border: 1px solid #2b313e;
 border-radius: 8px;
 background-color: #0e1117;
-padding: 8px;
+padding: 6px;
 }
 .jurnal-table {
 width: 100%;
 border-collapse: separate;
 border-spacing: 0;
 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-font-size: 0.92rem;
+font-size: 0.83rem;
 }
 .jurnal-table thead th {
 position: sticky;
 top: 0;
 background-color: #1a1f2c;
 color: #a0aab8;
-padding: 10px 12px;
+padding: 8px 8px;
 text-align: left;
 border-bottom: 2px solid #3a445e;
 z-index: 10;
 font-weight: 600;
+font-size: 0.82rem;
+white-space: nowrap;
 }
 .jurnal-table td {
-padding: 9px 12px;
+padding: 6px 8px;
+vertical-align: middle;
 }
 .row-open {
 background-color: #131722;
 }
 .row-close-win {
-background-color: rgba(40, 167, 69, 0.14);
+background-color: rgba(40, 167, 69, 0.12);
 }
 .row-close-loss {
-background-color: rgba(255, 51, 51, 0.14);
+background-color: rgba(255, 51, 51, 0.12);
 }
 .row-active {
-background-color: rgba(255, 193, 7, 0.14);
-}
-.badge-open {
-background-color: #262d3d;
-color: #b0b8c8;
-padding: 3px 8px;
-border-radius: 4px;
-font-size: 0.78rem;
-font-weight: bold;
-}
-.badge-close {
-background-color: #1e3a5f;
-color: #66b2ff;
-padding: 3px 8px;
-border-radius: 4px;
-font-size: 0.78rem;
-font-weight: bold;
-}
-.badge-active {
-background-color: #4d3800;
-color: #ffc107;
-padding: 3px 8px;
-border-radius: 4px;
-font-size: 0.78rem;
-font-weight: bold;
+background-color: rgba(255, 193, 7, 0.12);
 }
 </style>
 """
@@ -738,9 +715,8 @@ font-weight: bold;
     html_parts = [css, '<div class="jurnal-scroll-box"><table class="jurnal-table">']
     html_parts.append(
         '<thead><tr>'
-        '<th>Trade</th>'
-        '<th>Etapă</th>'
-        '<th>Data & Ora</th>'
+        '<th style="width: 55px;">Trade</th>'
+        '<th style="min-width: 130px;">Etapă & Dată</th>'
         '<th>Simbol</th>'
         '<th>Tip</th>'
         '<th>Preț Execuție</th>'
@@ -748,7 +724,7 @@ font-weight: bold;
         '<th>Valoare</th>'
         '<th>Execuție</th>'
         '<th>Comision</th>'
-        '<th style="text-align: right;">PnL</th>'
+        '<th style="text-align: right; min-width: 75px;">PnL</th>'
         '</tr></thead><tbody>'
     )
 
@@ -786,13 +762,16 @@ font-weight: bold;
 
             if rol == "ACTIVĂ":
                 row_cls = "row-active"
-                badge_html = '<span class="badge-active">⏳ ACTIVĂ</span>'
+                etapa_text_style = "color: #fbbf24; font-weight: bold; font-size: 0.81rem;"
+                etapa_icon = "⏳ ACTIVĂ"
             elif rol == "ÎNCHIDERE":
                 row_cls = "row-close-win" if pnl_num >= 0 else "row-close-loss"
-                badge_html = '<span class="badge-close">⏹ ÎNCHIDERE</span>'
+                etapa_text_style = "color: #60a5fa; font-weight: bold; font-size: 0.81rem;"
+                etapa_icon = "⏹ ÎNCHIDERE"
             else:
                 row_cls = "row-open"
-                badge_html = '<span class="badge-open">▶ DESCHIDERE</span>'
+                etapa_text_style = "color: #94a3b8; font-weight: bold; font-size: 0.81rem;"
+                etapa_icon = "▶ DESCHIDERE"
 
             b_top = f"border-top: 2px solid {border_color};" if r_idx == 0 else "border-top: 1px dashed #2d3446;"
             b_bot = f"border-bottom: 2px solid {border_color};" if r_idx == num_r - 1 else ""
@@ -804,10 +783,10 @@ font-weight: bold;
 
             if pnl_num > 0:
                 pnl_str = f"+${pnl_num:,.2f}"
-                pnl_style = "color: #00e676; font-weight: bold; font-size: 1.05rem;"
+                pnl_style = "color: #00e676; font-weight: bold; font-size: 0.95rem;"
             elif pnl_num < 0:
                 pnl_str = f"-${abs(pnl_num):,.2f}"
-                pnl_style = "color: #ff4d4d; font-weight: bold; font-size: 1.05rem;"
+                pnl_style = "color: #ff4d4d; font-weight: bold; font-size: 0.95rem;"
             else:
                 pnl_str = "$0.00"
                 pnl_style = "color: #7a8291;"
@@ -817,11 +796,16 @@ font-weight: bold;
             cant_str = f"{cant_val:,.0f}" if cant_val >= 100 else f"{cant_val:,.6f}"
             val_str = f"${safe_float(r['Valoare']):,.2f}"
 
+            etapa_data_cell = (
+                f'<div style="{etapa_text_style}">{etapa_icon}</div>'
+                f'<div style="border-top: 1px solid rgba(255, 255, 255, 0.12); margin: 3px 0 2px 0;"></div>'
+                f'<div style="color: #60a5fa; font-size: 0.75rem; white-space: nowrap;">{r["Data & Ora"]}</div>'
+            )
+
             row_html = (
                 f'<tr class="{row_cls}">'
                 f'<td style="{b_top} {b_bot} {b_left} color: #e2e8f0; font-weight: bold;">{r["Trade_ID"]}</td>'
-                f'<td style="{b_top} {b_bot}">{badge_html}</td>'
-                f'<td style="{b_top} {b_bot} color: #4da3ff;">{r["Data & Ora"]}</td>'
+                f'<td style="{b_top} {b_bot}">{etapa_data_cell}</td>'
                 f'<td style="{b_top} {b_bot} color: #00e676; font-weight: bold;">{r["Simbol"]}</td>'
                 f'<td style="{b_top} {b_bot} color: {tip_color}; font-weight: bold;">{tip_val}</td>'
                 f'<td style="{b_top} {b_bot} color: #ffc107;">{pret_str}</td>'
@@ -835,11 +819,10 @@ font-weight: bold;
             html_parts.append(row_html)
 
         if g_idx < len(groups) - 1:
-            html_parts.append('<tr style="height: 10px; background-color: #0e1117;"><td colspan="11" style="padding: 0; border: none;"></td></tr>')
+            html_parts.append('<tr style="height: 8px; background-color: #0e1117;"><td colspan="10" style="padding: 0; border: none;"></td></tr>')
 
     html_parts.append("</tbody></table></div>")
     raw_html = "\n".join(html_parts)
-    # Eliminăm orice indentare la început de linie pentru a preveni blocul de cod Markdown
     return "\n".join(line.strip() for line in raw_html.splitlines() if line.strip())
 
 
@@ -879,18 +862,15 @@ if exchange:
             min_date_avail = df_istoric['temp_dt'].dropna().min() or date(2026, 9, 20)
             max_date_avail = df_istoric['temp_dt'].dropna().max() or date.today()
 
-            # Rândul 1: De la și Până la (largi, ca să se vadă toată data)
             col_d1, col_d2 = st.columns(2)
             with col_d1:
                 sel_start_date = st.date_input("🗓️ De la (ZZ/LL/AAAA)", value=min_date_avail, min_value=date(2026, 9, 1), max_value=max_date_avail, format="DD/MM/YYYY", key="flt_start")
             with col_d2:
                 sel_end_date = st.date_input("🗓️ Până la (ZZ/LL/AAAA)", value=max_date_avail, min_value=date(2026, 9, 1), max_value=date.today(), format="DD/MM/YYYY", key="flt_end")
 
-            # Rândul 2: Monede (pe toată lățimea paginii, să încapă toate monedele înăuntru)
             lista_simboluri = sorted(df_istoric['Simbol'].dropna().unique().tolist())
             sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=lista_simboluri, key="flt_sym")
 
-            # Rândul 3: Direcție (dedesubt, pe toată lățimea, să încapă LONG și SHORT complet)
             sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"], key="flt_dir")
 
             matching_ids = df_istoric[
