@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import ccxt
 import time
+import json
 from datetime import datetime, timedelta, date, timezone
 import os
 
@@ -15,6 +16,30 @@ st.set_page_config(page_title="Kraken Universal Trading Journal", layout="wide")
 
 st.markdown("### 📊 Jurnal Universal de Trading (Kraken)")
 
+# Fișier de cache în afara folderului Git (pentru a memora cheile în siguranță fără a le urca pe GitHub)
+KEYS_CACHE_FILE = os.path.expanduser("~/.kraken_journal_keys.json")
+
+
+def load_cached_keys():
+    try:
+        if os.path.exists(KEYS_CACHE_FILE):
+            with open(KEYS_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_cached_keys(piata, key_val, secret_val):
+    try:
+        data = load_cached_keys()
+        data[piata] = {"key": key_val.strip(), "secret": secret_val.strip()}
+        with open(KEYS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
 with st.sidebar:
     st.header("🔑 Conexiune Kraken")
     piata_ales = st.selectbox("Alege Piața", ["Futures", "Spot"])
@@ -22,6 +47,7 @@ with st.sidebar:
     default_key = ""
     default_secret = ""
     
+    # 1. Încearcă citirea din Streamlit Secrets (Cloud sau local .streamlit/secrets.toml)
     try:
         if piata_ales == "Futures":
             default_key = st.secrets.get("KRAKEN_FUTURES_KEY", "")
@@ -31,6 +57,12 @@ with st.sidebar:
             default_secret = st.secrets.get("KRAKEN_SPOT_SECRET", "")
     except Exception:
         pass
+
+    # 2. Dacă nu există în Secrets, încarcă din fișierul memorat automat
+    if not default_key or not default_secret:
+        cached = load_cached_keys().get(piata_ales, {})
+        default_key = default_key or cached.get("key", "")
+        default_secret = default_secret or cached.get("secret", "")
         
     st.markdown("---")
     st.subheader("⚙️ Setări Monitorizare Live")
@@ -66,6 +98,7 @@ exchange = None
 if api_key_input and api_secret_input:
     try:
         exchange = get_exchange_connection(piata_ales, api_key_input, api_secret_input)
+        save_cached_keys(piata_ales, api_key_input, api_secret_input)
         st.sidebar.success(f"Conectat la Kraken {piata_ales} cu succes! ✅")
     except Exception as e:
         st.sidebar.error(f"Eroare de conexiune: {e}")
@@ -304,11 +337,6 @@ def color_active_table(df):
 
 
 def match_symbol_cycles(sym_orders):
-    """
-    Împerechează ordinele unui simbol în cicluri complete (Deschidere + Închidere)
-    unde suma cantităților deschise == suma cantităților închise.
-    Izolează orice ordin orfan pentru a nu contamina tranzacțiile următoare.
-    """
     n = len(sym_orders)
     cycles = []
     orphans = []
@@ -320,8 +348,6 @@ def match_symbol_cycles(sym_orders):
         for k in range(start_idx, min(n, start_idx + 15)):
             q = sym_orders[k]["Cantitate"]
             if sym_orders[k]["Tip"] == open_side:
-                # Dacă deja am început închiderea și apare un nou ordin pe direcția inițială,
-                # verificăm dacă nu cumva s-a început o tranzacție nouă
                 if close_qty > 0:
                     break
                 open_qty += q
@@ -338,7 +364,6 @@ def match_symbol_cycles(sym_orders):
     while i < n:
         end_k = find_cycle_end(i)
 
-        # Verificăm dacă ordinul curent `i` este un orfan lipit înaintea unui ciclu curat (ex. i+1 .. end_k)
         if end_k != -1 and end_k > i + 1:
             inner_end = find_cycle_end(i + 1)
             if inner_end != -1 and inner_end <= end_k:
@@ -369,7 +394,6 @@ def match_symbol_cycles(sym_orders):
             })
             i = end_k + 1
         else:
-            # Dacă suntem pe ultimul ordin din istoric (cel mai recent), este poziția activă deschisă acum
             if i == n - 1:
                 r_active = dict(sym_orders[i])
                 r_active["Rol"] = "ACTIVĂ"
@@ -587,7 +611,6 @@ def fetch_closed_trades_history(_exc, piata):
 
         aggregated_data.sort(key=lambda x: x["sort_timestamp"])
 
-        # Grupăm pe fiecare simbol și împerechem exact ciclurile Deschidere + Închidere
         by_symbol = {}
         for r in aggregated_data:
             by_symbol.setdefault(r["Simbol"], []).append(r)
@@ -614,7 +637,6 @@ def fetch_closed_trades_history(_exc, piata):
                 trade_label = "ACTIV"
                 cycle_pnl = 0.0
 
-            # În interiorul fiecărui chenar, punem Închiderea sus și Deschiderea jos (ordine cronologică inversă)
             rows_desc = sorted(c["rows"], key=lambda x: x["sort_timestamp"], reverse=True)
             for r in rows_desc:
                 r["Trade_ID"] = trade_label
@@ -626,7 +648,6 @@ def fetch_closed_trades_history(_exc, piata):
         df_final = pd.DataFrame(final_rows)
         if not df_final.empty:
             df_final['PnL'] = pd.to_numeric(df_final['PnL'], errors='coerce').fillna(0.0)
-            # Ordonăm grupurile de la cea mai recentă tranzacție la cea mai veche
             df_final = df_final.sort_values(
                 by=["Ciclu_Close_TS", "sort_timestamp"],
                 ascending=[False, False]
@@ -641,104 +662,96 @@ def fetch_closed_trades_history(_exc, piata):
 
 
 def render_boxed_trades_html(df):
-    """
-    Generează tabelul HTML cu chenar vizibil și spațiere clară în jurul fiecărei tranzacții
-    (grupând împreună Deschiderea și Închiderea aceleiași poziții).
-    """
     if df.empty:
         return "<p style='color: #aaa;'>Nu există tranzacții pentru filtrele selectate.</p>"
 
     css = """
-    <style>
-    .jurnal-scroll-box {
-        max-height: 600px;
-        overflow-y: auto;
-        border: 1px solid #2b313e;
-        border-radius: 8px;
-        background-color: #0e1117;
-        padding: 8px;
-    }
-    .jurnal-table {
-        width: 100%;
-        border-collapse: separate;
-        border-spacing: 0;
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        font-size: 0.92rem;
-    }
-    .jurnal-table thead th {
-        position: sticky;
-        top: 0;
-        background-color: #1a1f2c;
-        color: #a0aab8;
-        padding: 10px 12px;
-        text-align: left;
-        border-bottom: 2px solid #3a445e;
-        z-index: 10;
-        font-weight: 600;
-    }
-    .jurnal-table td {
-        padding: 9px 12px;
-    }
-    .row-open {
-        background-color: #131722;
-    }
-    .row-close-win {
-        background-color: rgba(40, 167, 69, 0.14);
-    }
-    .row-close-loss {
-        background-color: rgba(255, 51, 51, 0.14);
-    }
-    .row-active {
-        background-color: rgba(255, 193, 7, 0.14);
-    }
-    .badge-open {
-        background-color: #262d3d;
-        color: #b0b8c8;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 0.78rem;
-        font-weight: bold;
-    }
-    .badge-close {
-        background-color: #1e3a5f;
-        color: #66b2ff;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 0.78rem;
-        font-weight: bold;
-    }
-    .badge-active {
-        background-color: #4d3800;
-        color: #ffc107;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 0.78rem;
-        font-weight: bold;
-    }
-    </style>
-    """
+<style>
+.jurnal-scroll-box {
+max-height: 620px;
+overflow-y: auto;
+border: 1px solid #2b313e;
+border-radius: 8px;
+background-color: #0e1117;
+padding: 8px;
+}
+.jurnal-table {
+width: 100%;
+border-collapse: separate;
+border-spacing: 0;
+font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+font-size: 0.92rem;
+}
+.jurnal-table thead th {
+position: sticky;
+top: 0;
+background-color: #1a1f2c;
+color: #a0aab8;
+padding: 10px 12px;
+text-align: left;
+border-bottom: 2px solid #3a445e;
+z-index: 10;
+font-weight: 600;
+}
+.jurnal-table td {
+padding: 9px 12px;
+}
+.row-open {
+background-color: #131722;
+}
+.row-close-win {
+background-color: rgba(40, 167, 69, 0.14);
+}
+.row-close-loss {
+background-color: rgba(255, 51, 51, 0.14);
+}
+.row-active {
+background-color: rgba(255, 193, 7, 0.14);
+}
+.badge-open {
+background-color: #262d3d;
+color: #b0b8c8;
+padding: 3px 8px;
+border-radius: 4px;
+font-size: 0.78rem;
+font-weight: bold;
+}
+.badge-close {
+background-color: #1e3a5f;
+color: #66b2ff;
+padding: 3px 8px;
+border-radius: 4px;
+font-size: 0.78rem;
+font-weight: bold;
+}
+.badge-active {
+background-color: #4d3800;
+color: #ffc107;
+padding: 3px 8px;
+border-radius: 4px;
+font-size: 0.78rem;
+font-weight: bold;
+}
+</style>
+"""
 
     html_parts = [css, '<div class="jurnal-scroll-box"><table class="jurnal-table">']
-    html_parts.append("""
-        <thead>
-            <tr>
-                <th>Trade</th>
-                <th>Etapă</th>
-                <th>Data & Ora</th>
-                <th>Simbol</th>
-                <th>Tip</th>
-                <th>Preț Execuție</th>
-                <th>Cantitate</th>
-                <th>Valoare</th>
-                <th>Execuție</th>
-                <th>Comision</th>
-                <th style="text-align: right;">PnL</th>
-            </tr>
-        </thead>
-        <tbody>
-    """)
+    html_parts.append(
+        '<thead><tr>'
+        '<th>Trade</th>'
+        '<th>Etapă</th>'
+        '<th>Data & Ora</th>'
+        '<th>Simbol</th>'
+        '<th>Tip</th>'
+        '<th>Preț Execuție</th>'
+        '<th>Cantitate</th>'
+        '<th>Valoare</th>'
+        '<th>Execuție</th>'
+        '<th>Comision</th>'
+        '<th style="text-align: right;">PnL</th>'
+        '</tr></thead><tbody>'
+    )
 
-    # Grupăm rândurile după Trade_ID păstrând ordinea curentă
     groups = []
     curr_id = None
     curr_group = []
@@ -804,28 +817,30 @@ def render_boxed_trades_html(df):
             cant_str = f"{cant_val:,.0f}" if cant_val >= 100 else f"{cant_val:,.6f}"
             val_str = f"${safe_float(r['Valoare']):,.2f}"
 
-            html_parts.append(f"""
-                <tr class="{row_cls}">
-                    <td style="{b_top} {b_bot} {b_left} color: #e2e8f0; font-weight: bold;">{r['Trade_ID']}</td>
-                    <td style="{b_top} {b_bot}">{badge_html}</td>
-                    <td style="{b_top} {b_bot} color: #4da3ff;">{r['Data & Ora']}</td>
-                    <td style="{b_top} {b_bot} color: #00e676; font-weight: bold;">{r['Simbol']}</td>
-                    <td style="{b_top} {b_bot} color: {tip_color}; font-weight: bold;">{tip_val}</td>
-                    <td style="{b_top} {b_bot} color: #ffc107;">{pret_str}</td>
-                    <td style="{b_top} {b_bot} color: #b19cd9;">{cant_str}</td>
-                    <td style="{b_top} {b_bot} color: #20c997;">{val_str}</td>
-                    <td style="{b_top} {b_bot} color: #ffa500; font-weight: bold;">{r['Execuție']}</td>
-                    <td style="{b_top} {b_bot} color: #ff8c94;">{r['Comision']}</td>
-                    <td style="{b_top} {b_bot} {b_right} text-align: right; {pnl_style}">{pnl_str}</td>
-                </tr>
-            """)
+            row_html = (
+                f'<tr class="{row_cls}">'
+                f'<td style="{b_top} {b_bot} {b_left} color: #e2e8f0; font-weight: bold;">{r["Trade_ID"]}</td>'
+                f'<td style="{b_top} {b_bot}">{badge_html}</td>'
+                f'<td style="{b_top} {b_bot} color: #4da3ff;">{r["Data & Ora"]}</td>'
+                f'<td style="{b_top} {b_bot} color: #00e676; font-weight: bold;">{r["Simbol"]}</td>'
+                f'<td style="{b_top} {b_bot} color: {tip_color}; font-weight: bold;">{tip_val}</td>'
+                f'<td style="{b_top} {b_bot} color: #ffc107;">{pret_str}</td>'
+                f'<td style="{b_top} {b_bot} color: #b19cd9;">{cant_str}</td>'
+                f'<td style="{b_top} {b_bot} color: #20c997;">{val_str}</td>'
+                f'<td style="{b_top} {b_bot} color: #ffa500; font-weight: bold;">{r["Execuție"]}</td>'
+                f'<td style="{b_top} {b_bot} color: #ff8c94;">{r["Comision"]}</td>'
+                f'<td style="{b_top} {b_bot} {b_right} text-align: right; {pnl_style}">{pnl_str}</td>'
+                f'</tr>'
+            )
+            html_parts.append(row_html)
 
-        # Spațiu liber între chenarele tranzacțiilor
         if g_idx < len(groups) - 1:
             html_parts.append('<tr style="height: 10px; background-color: #0e1117;"><td colspan="11" style="padding: 0; border: none;"></td></tr>')
 
     html_parts.append("</tbody></table></div>")
-    return "".join(html_parts)
+    raw_html = "\n".join(html_parts)
+    # Eliminăm orice indentare la început de linie pentru a preveni blocul de cod Markdown
+    return "\n".join(line.strip() for line in raw_html.splitlines() if line.strip())
 
 
 if exchange:
@@ -853,7 +868,7 @@ if exchange:
         afiseaza_pozitii_live()
             
     with tab2:
-        col_btn, _ = st.columns([1, 4])
+        col_btn, _ = st.columns([1.5, 4])
         with col_btn:
             if st.button("🔄 Actualizează Istoricul"):
                 fetch_closed_trades_history.clear()
@@ -864,19 +879,20 @@ if exchange:
             min_date_avail = df_istoric['temp_dt'].dropna().min() or date(2026, 9, 20)
             max_date_avail = df_istoric['temp_dt'].dropna().max() or date.today()
 
-            col_d1, col_d2, col_sym, col_dir = st.columns([1.2, 1.2, 2.5, 1.5])
-
+            # Rândul 1: De la și Până la (largi, ca să se vadă toată data)
+            col_d1, col_d2 = st.columns(2)
             with col_d1:
                 sel_start_date = st.date_input("🗓️ De la (ZZ/LL/AAAA)", value=min_date_avail, min_value=date(2026, 9, 1), max_value=max_date_avail, format="DD/MM/YYYY", key="flt_start")
             with col_d2:
                 sel_end_date = st.date_input("🗓️ Până la (ZZ/LL/AAAA)", value=max_date_avail, min_value=date(2026, 9, 1), max_value=date.today(), format="DD/MM/YYYY", key="flt_end")
-            with col_sym:
-                lista_simboluri = sorted(df_istoric['Simbol'].dropna().unique().tolist())
-                sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=lista_simboluri, key="flt_sym")
-            with col_dir:
-                sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"], key="flt_dir")
 
-            # Păstrăm tranzacțiile întregi (ambele rânduri ale aceluiași Trade_ID) care se încadrează în filtre
+            # Rândul 2: Monede (pe toată lățimea paginii, să încapă toate monedele înăuntru)
+            lista_simboluri = sorted(df_istoric['Simbol'].dropna().unique().tolist())
+            sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=lista_simboluri, key="flt_sym")
+
+            # Rândul 3: Direcție (dedesubt, pe toată lățimea, să încapă LONG și SHORT complet)
+            sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"], key="flt_dir")
+
             matching_ids = df_istoric[
                 (df_istoric['temp_dt'] >= sel_start_date) &
                 (df_istoric['temp_dt'] <= sel_end_date) &
@@ -889,7 +905,6 @@ if exchange:
             total_pnl = df_filtrat['PnL'].sum() if not df_filtrat.empty else 0.0
             total_comision = df_filtrat['Comision_Val'].sum() if ('Comision_Val' in df_filtrat.columns and not df_filtrat.empty) else 0.0
             
-            # Calculăm KPI strict pe ciclurile de tranzacționare finalizate (nu pe numărul de rânduri)
             df_closed_cycles = df_filtrat[df_filtrat['Status_Ciclu'] == "CLOSED"].groupby("Trade_ID", as_index=False)['PnL'].sum() if not df_filtrat.empty else pd.DataFrame()
             nr_tranzactii_inchise = len(df_closed_cycles)
             nr_active_acum = len(df_filtrat[df_filtrat['Status_Ciclu'] == "OPEN"]['Trade_ID'].unique()) if not df_filtrat.empty else 0
@@ -908,11 +923,11 @@ if exchange:
                 sign = "+" if total_pnl >= 0 else ""
                 
                 st.markdown(f"""
-                <div style="background-color: {bg_color}; border: 1px solid {text_color}; border-radius: 8px; padding: 15px; text-align: center;">
-                    <h3 style="margin: 0; color: #ffffff; font-size: 1.2rem;">PnL Total Cumulat</h3>
-                    <h2 style="margin: 5px 0 0 0; color: {text_color}; font-size: 2.2rem;">{sign}${total_pnl:,.2f}</h2>
-                </div>
-                """, unsafe_allow_html=True)
+<div style="background-color: {bg_color}; border: 1px solid {text_color}; border-radius: 8px; padding: 15px; text-align: center;">
+<h3 style="margin: 0; color: #ffffff; font-size: 1.2rem;">PnL Total Cumulat</h3>
+<h2 style="margin: 5px 0 0 0; color: {text_color}; font-size: 2.2rem;">{sign}${total_pnl:,.2f}</h2>
+</div>
+""", unsafe_allow_html=True)
 
             with col_kpi_table:
                 def color_val(val, is_currency=True, neutral=False):
@@ -926,23 +941,23 @@ if exchange:
                 text_tranzactii = f"{nr_tranzactii_inchise}" + (f" (+{nr_active_acum} activă)" if nr_active_acum > 0 else "")
 
                 st.markdown(f"""
-                <table style="width: 100%; text-align: center; border-collapse: collapse; font-size: 1rem; margin-top: 5px;">
-                    <tr>
-                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Tranzacții Complete</th>
-                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Win Rate</th>
-                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Comision Perioadă</th>
-                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai bun Trade</th>
-                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai slab Trade</th>
-                    </tr>
-                    <tr>
-                        <td style="padding: 10px; font-weight: bold;">{color_val(text_tranzactii, is_currency=False, neutral=True)}</td>
-                        <td style="padding: 10px; font-weight: bold;">{color_val(f'{win_rate:.1f}%', is_currency=False, neutral=True)}</td>
-                        <td style="padding: 10px; font-weight: bold; color: #ff8c94;">${total_comision:,.2f}</td>
-                        <td style="padding: 10px; font-weight: bold;">{color_val(best_trade)}</td>
-                        <td style="padding: 10px; font-weight: bold;">{color_val(worst_trade)}</td>
-                    </tr>
-                </table>
-                """, unsafe_allow_html=True)
+<table style="width: 100%; text-align: center; border-collapse: collapse; font-size: 1rem; margin-top: 5px;">
+<tr>
+<th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Tranzacții Complete</th>
+<th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Win Rate</th>
+<th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Comision Perioadă</th>
+<th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai bun Trade</th>
+<th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai slab Trade</th>
+</tr>
+<tr>
+<td style="padding: 10px; font-weight: bold;">{color_val(text_tranzactii, is_currency=False, neutral=True)}</td>
+<td style="padding: 10px; font-weight: bold;">{color_val(f'{win_rate:.1f}%', is_currency=False, neutral=True)}</td>
+<td style="padding: 10px; font-weight: bold; color: #ff8c94;">${total_comision:,.2f}</td>
+<td style="padding: 10px; font-weight: bold;">{color_val(best_trade)}</td>
+<td style="padding: 10px; font-weight: bold;">{color_val(worst_trade)}</td>
+</tr>
+</table>
+""", unsafe_allow_html=True)
 
             st.markdown("<br>", unsafe_allow_html=True)
             col_exp_chart, col_exp_csv = st.columns(2)
