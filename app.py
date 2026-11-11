@@ -80,6 +80,22 @@ def safe_float(val, default=0.0):
         return default
 
 
+def format_smart_price(val):
+    try:
+        num = safe_float(val)
+        if num <= 0:
+            return "-"
+        if num < 0.001:
+            return f"${num:,.8f}"
+        if num < 1.0:
+            return f"${num:,.6f}"
+        if num < 100.0:
+            return f"${num:,.4f}"
+        return f"${num:,.2f}"
+    except Exception:
+        return "-"
+
+
 def get_ts_ms(raw_ts):
     if not raw_ts:
         return 0
@@ -186,10 +202,7 @@ def fetch_active_positions(exc, piata):
                 else:
                     pnl = safe_float(p.get('unrealizedPnl', 0))
                 
-                sl_val = "-"
-                tp_val = "-"
-                limit_val = "-"
-                trailing_val = "-"
+                sl_val, tp_val, limit_val, trailing_val = "-", "-", "-", "-"
                 
                 for o in open_orders:
                     if o.get('symbol') == simbol_raw or simbol_curat in str(o.get('symbol')):
@@ -279,25 +292,104 @@ def color_active_table(df):
         except Exception:
             return "$0.00"
 
-    def format_price(val):
-        try:
-            num = safe_float(val)
-            return "-" if num <= 0 else f"${num:,.4f}"
-        except Exception:
-            return "-"
-
     return styled.format({
-        "Preț Intrare": "${:,.4f}",
-        "Preț Mark (Live)": format_price,
+        "Preț Intrare": format_smart_price,
+        "Preț Mark (Live)": format_smart_price,
         "Valoare": "${:,.2f}",
-        "Stop Loss": format_price,
-        "Take Profit": format_price,
-        "Limit": format_price,
+        "Stop Loss": format_smart_price,
+        "Take Profit": format_smart_price,
+        "Limit": format_smart_price,
         "PnL": format_pnl
     })
 
 
-@st.cache_data(ttl=120, show_spinner="Se descarcă istoricul complet de pe Kraken (începând din 20 septembrie)...")
+def match_symbol_cycles(sym_orders):
+    """
+    Împerechează ordinele unui simbol în cicluri complete (Deschidere + Închidere)
+    unde suma cantităților deschise == suma cantităților închise.
+    Izolează orice ordin orfan pentru a nu contamina tranzacțiile următoare.
+    """
+    n = len(sym_orders)
+    cycles = []
+    orphans = []
+
+    def find_cycle_end(start_idx):
+        open_side = sym_orders[start_idx]["Tip"]
+        open_qty = 0.0
+        close_qty = 0.0
+        for k in range(start_idx, min(n, start_idx + 15)):
+            q = sym_orders[k]["Cantitate"]
+            if sym_orders[k]["Tip"] == open_side:
+                # Dacă deja am început închiderea și apare un nou ordin pe direcția inițială,
+                # verificăm dacă nu cumva s-a început o tranzacție nouă
+                if close_qty > 0:
+                    break
+                open_qty += q
+            else:
+                close_qty += q
+                tol = max(1e-9, open_qty * 1e-4)
+                if abs(open_qty - close_qty) <= tol:
+                    return k
+                elif close_qty > open_qty + tol:
+                    return -1
+        return -1
+
+    i = 0
+    while i < n:
+        end_k = find_cycle_end(i)
+
+        # Verificăm dacă ordinul curent `i` este un orfan lipit înaintea unui ciclu curat (ex. i+1 .. end_k)
+        if end_k != -1 and end_k > i + 1:
+            inner_end = find_cycle_end(i + 1)
+            if inner_end != -1 and inner_end <= end_k:
+                end_k = -1
+
+        if end_k != -1:
+            cycle_rows = [dict(r) for r in sym_orders[i:end_k + 1]]
+            open_side = cycle_rows[0]["Tip"]
+            total_open_qty = sum(r["Cantitate"] for r in cycle_rows if r["Tip"] == open_side)
+            total_open_val = sum(r["Cantitate"] * r["Preț Execuție"] for r in cycle_rows if r["Tip"] == open_side)
+            avg_entry_price = (total_open_val / total_open_qty) if total_open_qty > 0 else 0.0
+
+            for r in cycle_rows:
+                if r["Tip"] == open_side:
+                    r["Rol"] = "DESCHIDERE"
+                    r["PnL"] = 0.0
+                else:
+                    r["Rol"] = "ÎNCHIDERE"
+                    if open_side == "LONG":
+                        r["PnL"] = round((r["Preț Execuție"] - avg_entry_price) * r["Cantitate"], 2)
+                    else:
+                        r["PnL"] = round((avg_entry_price - r["Preț Execuție"]) * r["Cantitate"], 2)
+
+            cycles.append({
+                "status": "CLOSED",
+                "close_ts": cycle_rows[-1]["sort_timestamp"],
+                "rows": cycle_rows
+            })
+            i = end_k + 1
+        else:
+            # Dacă suntem pe ultimul ordin din istoric (cel mai recent), este poziția activă deschisă acum
+            if i == n - 1:
+                r_active = dict(sym_orders[i])
+                r_active["Rol"] = "ACTIVĂ"
+                r_active["PnL"] = 0.0
+                cycles.append({
+                    "status": "OPEN",
+                    "close_ts": r_active["sort_timestamp"],
+                    "rows": [r_active]
+                })
+            else:
+                r_orph = dict(sym_orders[i])
+                r_orph["Rol"] = "ORFAN"
+                r_orph["PnL"] = 0.0
+                orphans.append(r_orph)
+            i += 1
+
+    return cycles, orphans
+
+
+@st.cache_data(ttl=120, show_spinner="Se descarcă și se împerechează tranzacțiile de pe Kraken...")
 def fetch_closed_trades_history(_exc, piata):
     raw_rows = []
     try:
@@ -361,9 +453,7 @@ def fetch_closed_trades_history(_exc, piata):
                         oldest_ts_ms = ts_ms
                         oldest_iso_str = info_item.get('fillTime') if isinstance(info_item.get('fillTime'), str) else to_iso_utc(ts_ms)
 
-                if oldest_ts_ms is None:
-                    break
-                if oldest_ts_ms < (since_timestamp - 2 * 86400 * 1000):
+                if oldest_ts_ms is None or oldest_ts_ms < (since_timestamp - 2 * 86400 * 1000):
                     break
 
                 next_param = oldest_iso_str or to_iso_utc(oldest_ts_ms - 1)
@@ -436,12 +526,6 @@ def fetch_closed_trades_history(_exc, piata):
                 else:
                     exec_detaliat = "MANUAL"
                 
-            pnl_val = safe_float(
-                info.get('realisedPnl') or info.get('realizedPnl') or 
-                info.get('realised_pnl') or info.get('realized_pnl') or 
-                info.get('pnl') or t.get('pnl') or 0
-            )
-            
             pret = safe_float(
                 t.get('price') or info.get('price') or 
                 info.get('fillPrice') or info.get('executionPrice') or 0
@@ -467,12 +551,11 @@ def fetch_closed_trades_history(_exc, piata):
                     "pret_parțial": valoare_fill,
                     "Cantitate": cantitate,
                     "Execuție": exec_detaliat,
-                    "Comision": comision,
-                    "PnL": pnl_val
+                    "Comision": comision
                 })
                 
         if not raw_rows:
-            return pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame()
 
         df_raw = pd.DataFrame(raw_rows)
         
@@ -483,7 +566,6 @@ def fetch_closed_trades_history(_exc, piata):
             pret_mediu = (valoare_totala / cantitate_totala) if cantitate_totala > 0 else 0.0
             
             comision_total = safe_float(grup["Comision"].sum())
-            pnl_total = safe_float(grup["PnL"].sum())
             pct_comision = (comision_total / valoare_totala * 100) if valoare_totala > 0 else 0.0
             comision_str = f"${comision_total:,.4f} ({pct_comision:.2f}%)"
             
@@ -500,116 +582,250 @@ def fetch_closed_trades_history(_exc, piata):
                 "Valoare": valoare_totala,
                 "Execuție": first_row["Execuție"],
                 "Comision_Val": comision_total,
-                "Comision": comision_str,
-                "PnL_API": pnl_total
+                "Comision": comision_str
             })
 
         aggregated_data.sort(key=lambda x: x["sort_timestamp"])
-        open_positions = {}
 
-        for row in aggregated_data:
-            sym = row["Simbol"]
-            side = row["Tip"]
-            qty = row["Cantitate"]
-            price = row["Preț Execuție"]
-            pos = open_positions.get(sym, {"side": None, "qty": 0.0, "price": 0.0})
-            calc_pnl = 0.0
+        # Grupăm pe fiecare simbol și împerechem exact ciclurile Deschidere + Închidere
+        by_symbol = {}
+        for r in aggregated_data:
+            by_symbol.setdefault(r["Simbol"], []).append(r)
 
-            if pos["qty"] <= 1e-9 or pos["side"] == side:
-                new_qty = pos["qty"] + qty
-                new_price = ((pos["qty"] * pos["price"]) + (qty * price)) / new_qty if new_qty > 0 else price
-                open_positions[sym] = {"side": side, "qty": new_qty, "price": new_price}
-            else:
-                closed_qty = min(pos["qty"], qty)
-                if pos["side"] == "LONG":
-                    calc_pnl = (price - pos["price"]) * closed_qty
-                elif pos["side"] == "SHORT":
-                    calc_pnl = (pos["price"] - price) * closed_qty
-
-                rem_pos = pos["qty"] - closed_qty
-                rem_order = qty - closed_qty
-
-                if rem_pos > 1e-9:
-                    open_positions[sym] = {"side": pos["side"], "qty": rem_pos, "price": pos["price"]}
-                elif rem_order > 1e-9:
-                    open_positions[sym] = {"side": side, "qty": rem_order, "price": price}
-                else:
-                    open_positions[sym] = {"side": None, "qty": 0.0, "price": 0.0}
-
-            row["PnL"] = row["PnL_API"] if abs(row["PnL_API"]) > 1e-9 else round(calc_pnl, 2)
-            del row["PnL_API"]
+        all_cycles = []
+        all_orphans = []
+        for sym, sym_orders in by_symbol.items():
+            c_list, o_list = match_symbol_cycles(sym_orders)
+            all_cycles.extend(c_list)
+            all_orphans.extend(o_list)
 
         cutoff_sec = since_timestamp / 1000.0
-        aggregated_data = [r for r in aggregated_data if r["sort_timestamp"] >= cutoff_sec]
+        valid_cycles = [c for c in all_cycles if c["close_ts"] >= cutoff_sec]
+        valid_cycles.sort(key=lambda c: c["close_ts"])
 
-        df_final = pd.DataFrame(aggregated_data)
-        
+        final_rows = []
+        closed_counter = 0
+        for c in valid_cycles:
+            if c["status"] == "CLOSED":
+                closed_counter += 1
+                trade_label = f"#{closed_counter}"
+                cycle_pnl = sum(r["PnL"] for r in c["rows"])
+            else:
+                trade_label = "ACTIV"
+                cycle_pnl = 0.0
+
+            # În interiorul fiecărui chenar, punem Închiderea sus și Deschiderea jos (ordine cronologică inversă)
+            rows_desc = sorted(c["rows"], key=lambda x: x["sort_timestamp"], reverse=True)
+            for r in rows_desc:
+                r["Trade_ID"] = trade_label
+                r["Status_Ciclu"] = c["status"]
+                r["Ciclu_PnL"] = cycle_pnl
+                r["Ciclu_Close_TS"] = c["close_ts"]
+                final_rows.append(r)
+
+        df_final = pd.DataFrame(final_rows)
         if not df_final.empty:
             df_final['PnL'] = pd.to_numeric(df_final['PnL'], errors='coerce').fillna(0.0)
-            df_final = df_final.sort_values(by="sort_timestamp", ascending=False).drop(columns=["sort_timestamp"]).reset_index(drop=True)
-            
-        return df_final
+            # Ordonăm grupurile de la cea mai recentă tranzacție la cea mai veche
+            df_final = df_final.sort_values(
+                by=["Ciclu_Close_TS", "sort_timestamp"],
+                ascending=[False, False]
+            ).reset_index(drop=True)
+
+        df_orphans = pd.DataFrame(all_orphans)
+        return df_final, df_orphans
         
     except Exception as e:
         st.warning(f"A apărut o problemă la preluarea datelor: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
 
-def color_trade_table(df):
-    if df.empty or 'PnL' not in df.columns:
-        return df
+def render_boxed_trades_html(df):
+    """
+    Generează tabelul HTML cu chenar vizibil și spațiere clară în jurul fiecărei tranzacții
+    (grupând împreună Deschiderea și Închiderea aceleiași poziții).
+    """
+    if df.empty:
+        return "<p style='color: #aaa;'>Nu există tranzacții pentru filtrele selectate.</p>"
 
-    df_viz = df.copy()
-    if 'Comision_Val' in df_viz.columns:
-        df_viz = df_viz.drop(columns=['Comision_Val'])
+    css = """
+    <style>
+    .jurnal-scroll-box {
+        max-height: 600px;
+        overflow-y: auto;
+        border: 1px solid #2b313e;
+        border-radius: 8px;
+        background-color: #0e1117;
+        padding: 8px;
+    }
+    .jurnal-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        font-size: 0.92rem;
+    }
+    .jurnal-table thead th {
+        position: sticky;
+        top: 0;
+        background-color: #1a1f2c;
+        color: #a0aab8;
+        padding: 10px 12px;
+        text-align: left;
+        border-bottom: 2px solid #3a445e;
+        z-index: 10;
+        font-weight: 600;
+    }
+    .jurnal-table td {
+        padding: 9px 12px;
+    }
+    .row-open {
+        background-color: #131722;
+    }
+    .row-close-win {
+        background-color: rgba(40, 167, 69, 0.14);
+    }
+    .row-close-loss {
+        background-color: rgba(255, 51, 51, 0.14);
+    }
+    .row-active {
+        background-color: rgba(255, 193, 7, 0.14);
+    }
+    .badge-open {
+        background-color: #262d3d;
+        color: #b0b8c8;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 0.78rem;
+        font-weight: bold;
+    }
+    .badge-close {
+        background-color: #1e3a5f;
+        color: #66b2ff;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 0.78rem;
+        font-weight: bold;
+    }
+    .badge-active {
+        background-color: #4d3800;
+        color: #ffc107;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 0.78rem;
+        font-weight: bold;
+    }
+    </style>
+    """
 
-    df_viz['PnL'] = pd.to_numeric(df_viz['PnL'], errors='coerce').fillna(0.0)
+    html_parts = [css, '<div class="jurnal-scroll-box"><table class="jurnal-table">']
+    html_parts.append("""
+        <thead>
+            <tr>
+                <th>Trade</th>
+                <th>Etapă</th>
+                <th>Data & Ora</th>
+                <th>Simbol</th>
+                <th>Tip</th>
+                <th>Preț Execuție</th>
+                <th>Cantitate</th>
+                <th>Valoare</th>
+                <th>Execuție</th>
+                <th>Comision</th>
+                <th style="text-align: right;">PnL</th>
+            </tr>
+        </thead>
+        <tbody>
+    """)
 
-    def highlight_closing_rows(row):
-        try:
-            if safe_float(row['PnL']) != 0.0:
-                return ['background-color: rgba(77, 163, 255, 0.12);'] * len(row)
-        except Exception:
-            pass
-        return [''] * len(row)
+    # Grupăm rândurile după Trade_ID păstrând ordinea curentă
+    groups = []
+    curr_id = None
+    curr_group = []
+    for _, row in df.iterrows():
+        t_id = row["Trade_ID"]
+        if t_id != curr_id:
+            if curr_group:
+                groups.append(curr_group)
+            curr_group = [row]
+            curr_id = t_id
+        else:
+            curr_group.append(row)
+    if curr_group:
+        groups.append(curr_group)
 
-    def highlight_tip(val):
-        if val == "LONG": return 'color: #28a745; font-weight: bold;'
-        elif val == "SHORT": return 'color: #ff3333; font-weight: bold;'
-        return ''
+    for g_idx, group_rows in enumerate(groups):
+        status = group_rows[0]["Status_Ciclu"]
+        c_pnl = safe_float(group_rows[0]["Ciclu_PnL"])
+        if status == "OPEN":
+            border_color = "#ffc107"
+        elif c_pnl > 0:
+            border_color = "#28a745"
+        elif c_pnl < 0:
+            border_color = "#dc3545"
+        else:
+            border_color = "#4a6fa5"
 
-    def highlight_pnl(val):
-        try:
-            num = safe_float(val)
-            if num > 0: return 'color: #28a745; font-weight: bold; font-size: 1.1em;'
-            elif num < 0: return 'color: #ff3333; font-weight: bold; font-size: 1.1em;'
-            else: return 'color: #6c757d;'
-        except Exception:
-            return ''
+        num_r = len(group_rows)
+        for r_idx, r in enumerate(group_rows):
+            rol = r["Rol"]
+            pnl_num = safe_float(r["PnL"])
 
-    styled = df_viz.style.apply(highlight_closing_rows, axis=1)
-    styled = styled.map(highlight_tip, subset=['Tip'])
-    if "PnL" in df_viz.columns: styled = styled.map(highlight_pnl, subset=['PnL'])
-    if "Data & Ora" in df_viz.columns: styled = styled.map(lambda _: 'color: #4da3ff;', subset=['Data & Ora'])
-    if "Simbol" in df_viz.columns: styled = styled.map(lambda _: 'color: #00e676; font-weight: bold;', subset=['Simbol'])
-    if "Preț Execuție" in df_viz.columns: styled = styled.map(lambda _: 'color: #ffc107;', subset=['Preț Execuție'])
-    if "Cantitate" in df_viz.columns: styled = styled.map(lambda _: 'color: #b19cd9;', subset=['Cantitate'])
-    if "Valoare" in df_viz.columns: styled = styled.map(lambda _: 'color: #20c997;', subset=['Valoare'])
-    if "Execuție" in df_viz.columns: styled = styled.map(lambda _: 'color: #ffa500; font-weight: bold;', subset=['Execuție'])
-    if "Comision" in df_viz.columns: styled = styled.map(lambda _: 'color: #ff8c94;', subset=['Comision'])
-        
-    def format_pnl(val):
-        try:
-            num = safe_float(val)
-            return "$0.00" if num == 0 else f"${num:+,.2f}"
-        except Exception:
-            return "$0.00"
-            
-    return styled.format({
-        "Preț Execuție": "${:,.4f}",
-        "Valoare": "${:,.2f}",
-        "PnL": format_pnl
-    })
+            if rol == "ACTIVĂ":
+                row_cls = "row-active"
+                badge_html = '<span class="badge-active">⏳ ACTIVĂ</span>'
+            elif rol == "ÎNCHIDERE":
+                row_cls = "row-close-win" if pnl_num >= 0 else "row-close-loss"
+                badge_html = '<span class="badge-close">⏹ ÎNCHIDERE</span>'
+            else:
+                row_cls = "row-open"
+                badge_html = '<span class="badge-open">▶ DESCHIDERE</span>'
+
+            b_top = f"border-top: 2px solid {border_color};" if r_idx == 0 else "border-top: 1px dashed #2d3446;"
+            b_bot = f"border-bottom: 2px solid {border_color};" if r_idx == num_r - 1 else ""
+            b_left = f"border-left: 3px solid {border_color};"
+            b_right = f"border-right: 2px solid {border_color};"
+
+            tip_val = r["Tip"]
+            tip_color = "#28a745" if tip_val == "LONG" else "#ff4d4d"
+
+            if pnl_num > 0:
+                pnl_str = f"+${pnl_num:,.2f}"
+                pnl_style = "color: #00e676; font-weight: bold; font-size: 1.05rem;"
+            elif pnl_num < 0:
+                pnl_str = f"-${abs(pnl_num):,.2f}"
+                pnl_style = "color: #ff4d4d; font-weight: bold; font-size: 1.05rem;"
+            else:
+                pnl_str = "$0.00"
+                pnl_style = "color: #7a8291;"
+
+            pret_str = format_smart_price(r["Preț Execuție"])
+            cant_val = safe_float(r["Cantitate"])
+            cant_str = f"{cant_val:,.0f}" if cant_val >= 100 else f"{cant_val:,.6f}"
+            val_str = f"${safe_float(r['Valoare']):,.2f}"
+
+            html_parts.append(f"""
+                <tr class="{row_cls}">
+                    <td style="{b_top} {b_bot} {b_left} color: #e2e8f0; font-weight: bold;">{r['Trade_ID']}</td>
+                    <td style="{b_top} {b_bot}">{badge_html}</td>
+                    <td style="{b_top} {b_bot} color: #4da3ff;">{r['Data & Ora']}</td>
+                    <td style="{b_top} {b_bot} color: #00e676; font-weight: bold;">{r['Simbol']}</td>
+                    <td style="{b_top} {b_bot} color: {tip_color}; font-weight: bold;">{tip_val}</td>
+                    <td style="{b_top} {b_bot} color: #ffc107;">{pret_str}</td>
+                    <td style="{b_top} {b_bot} color: #b19cd9;">{cant_str}</td>
+                    <td style="{b_top} {b_bot} color: #20c997;">{val_str}</td>
+                    <td style="{b_top} {b_bot} color: #ffa500; font-weight: bold;">{r['Execuție']}</td>
+                    <td style="{b_top} {b_bot} color: #ff8c94;">{r['Comision']}</td>
+                    <td style="{b_top} {b_bot} {b_right} text-align: right; {pnl_style}">{pnl_str}</td>
+                </tr>
+            """)
+
+        # Spațiu liber între chenarele tranzacțiilor
+        if g_idx < len(groups) - 1:
+            html_parts.append('<tr style="height: 10px; background-color: #0e1117;"><td colspan="11" style="padding: 0; border: none;"></td></tr>')
+
+    html_parts.append("</tbody></table></div>")
+    return "".join(html_parts)
 
 
 if exchange:
@@ -642,7 +858,7 @@ if exchange:
             if st.button("🔄 Actualizează Istoricul"):
                 fetch_closed_trades_history.clear()
                 
-        df_istoric = fetch_closed_trades_history(exchange, piata_ales)
+        df_istoric, df_orphans = fetch_closed_trades_history(exchange, piata_ales)
         if not df_istoric.empty:
             df_istoric['temp_dt'] = pd.to_datetime(df_istoric['Data & Ora'], format='%d-%m-%Y %H:%M', errors='coerce').dt.date
             min_date_avail = df_istoric['temp_dt'].dropna().min() or date(2026, 9, 20)
@@ -651,30 +867,36 @@ if exchange:
             col_d1, col_d2, col_sym, col_dir = st.columns([1.2, 1.2, 2.5, 1.5])
 
             with col_d1:
-                sel_start_date = st.date_input("🗓️ De la (ZZ/LL/AAAA)", value=min_date_avail, min_value=date(2026, 9, 1), max_value=max_date_avail, format="DD/MM/YYYY")
+                sel_start_date = st.date_input("🗓️ De la (ZZ/LL/AAAA)", value=min_date_avail, min_value=date(2026, 9, 1), max_value=max_date_avail, format="DD/MM/YYYY", key="flt_start")
             with col_d2:
-                sel_end_date = st.date_input("🗓️ Până la (ZZ/LL/AAAA)", value=max_date_avail, min_value=date(2026, 9, 1), max_value=date.today(), format="DD/MM/YYYY")
+                sel_end_date = st.date_input("🗓️ Până la (ZZ/LL/AAAA)", value=max_date_avail, min_value=date(2026, 9, 1), max_value=date.today(), format="DD/MM/YYYY", key="flt_end")
             with col_sym:
                 lista_simboluri = sorted(df_istoric['Simbol'].dropna().unique().tolist())
-                sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=lista_simboluri)
+                sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=lista_simboluri, key="flt_sym")
             with col_dir:
-                sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"])
+                sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=["LONG", "SHORT"], key="flt_dir")
 
-            df_filtrat = df_istoric[
+            # Păstrăm tranzacțiile întregi (ambele rânduri ale aceluiași Trade_ID) care se încadrează în filtre
+            matching_ids = df_istoric[
                 (df_istoric['temp_dt'] >= sel_start_date) &
                 (df_istoric['temp_dt'] <= sel_end_date) &
                 (df_istoric['Simbol'].isin(sel_simboluri)) &
                 (df_istoric['Tip'].isin(sel_directii))
-            ].copy().drop(columns=['temp_dt'])
+            ]['Trade_ID'].unique()
+
+            df_filtrat = df_istoric[df_istoric['Trade_ID'].isin(matching_ids)].copy().drop(columns=['temp_dt'])
 
             total_pnl = df_filtrat['PnL'].sum() if not df_filtrat.empty else 0.0
             total_comision = df_filtrat['Comision_Val'].sum() if ('Comision_Val' in df_filtrat.columns and not df_filtrat.empty) else 0.0
             
-            trades_inchise = df_filtrat[df_filtrat['PnL'] != 0.0] if not df_filtrat.empty else pd.DataFrame()
-            nr_inchise = len(trades_inchise)
-            win_rate = (len(trades_inchise[trades_inchise['PnL'] > 0]) / nr_inchise * 100.0) if nr_inchise > 0 else 0.0
-            best_trade = trades_inchise['PnL'].max() if nr_inchise > 0 else 0.0
-            worst_trade = trades_inchise['PnL'].min() if nr_inchise > 0 else 0.0
+            # Calculăm KPI strict pe ciclurile de tranzacționare finalizate (nu pe numărul de rânduri)
+            df_closed_cycles = df_filtrat[df_filtrat['Status_Ciclu'] == "CLOSED"].groupby("Trade_ID", as_index=False)['PnL'].sum() if not df_filtrat.empty else pd.DataFrame()
+            nr_tranzactii_inchise = len(df_closed_cycles)
+            nr_active_acum = len(df_filtrat[df_filtrat['Status_Ciclu'] == "OPEN"]['Trade_ID'].unique()) if not df_filtrat.empty else 0
+
+            win_rate = (len(df_closed_cycles[df_closed_cycles['PnL'] > 0]) / nr_tranzactii_inchise * 100.0) if nr_tranzactii_inchise > 0 else 0.0
+            best_trade = df_closed_cycles['PnL'].max() if nr_tranzactii_inchise > 0 else 0.0
+            worst_trade = df_closed_cycles['PnL'].min() if nr_tranzactii_inchise > 0 else 0.0
 
             st.markdown("<br>", unsafe_allow_html=True)
             
@@ -701,17 +923,19 @@ if exchange:
                         else: return "<span style='color: #6c757d;'>$0.00</span>"
                     return val
 
+                text_tranzactii = f"{nr_tranzactii_inchise}" + (f" (+{nr_active_acum} activă)" if nr_active_acum > 0 else "")
+
                 st.markdown(f"""
                 <table style="width: 100%; text-align: center; border-collapse: collapse; font-size: 1rem; margin-top: 5px;">
                     <tr>
-                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Tranzacții (Închise/Total)</th>
+                        <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Tranzacții Complete</th>
                         <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Win Rate</th>
                         <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Comision Perioadă</th>
                         <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai bun Trade</th>
                         <th style="padding: 8px; border-bottom: 1px solid #444; color: #aaa;">Cel mai slab Trade</th>
                     </tr>
                     <tr>
-                        <td style="padding: 10px; font-weight: bold;">{color_val(f'{nr_inchise} / {len(df_filtrat)}', is_currency=False, neutral=True)}</td>
+                        <td style="padding: 10px; font-weight: bold;">{color_val(text_tranzactii, is_currency=False, neutral=True)}</td>
                         <td style="padding: 10px; font-weight: bold;">{color_val(f'{win_rate:.1f}%', is_currency=False, neutral=True)}</td>
                         <td style="padding: 10px; font-weight: bold; color: #ff8c94;">${total_comision:,.2f}</td>
                         <td style="padding: 10px; font-weight: bold;">{color_val(best_trade)}</td>
@@ -720,15 +944,14 @@ if exchange:
                 </table>
                 """, unsafe_allow_html=True)
 
-
             st.markdown("<br>", unsafe_allow_html=True)
             col_exp_chart, col_exp_csv = st.columns(2)
             
             with col_exp_chart:
                 with st.expander("📈 Grafic Evoluție PnL Cumulat (Equity Curve)", expanded=False):
-                    if not trades_inchise.empty:
-                        df_chart = trades_inchise.iloc[::-1].copy()
-                        # REZOLVARE EROARE GRAFIC: Conversie string în Datetime strict pentru axa de timp
+                    trades_inchise_rows = df_filtrat[df_filtrat['Rol'] == "ÎNCHIDERE"]
+                    if not trades_inchise_rows.empty:
+                        df_chart = trades_inchise_rows.iloc[::-1].copy()
                         df_chart['Timp_Fix'] = pd.to_datetime(df_chart['Data & Ora'], format='%d-%m-%Y %H:%M')
                         df_chart['PnL Cumulat ($)'] = df_chart['PnL'].cumsum()
                         st.line_chart(df_chart, x='Timp_Fix', y='PnL Cumulat ($)', color="#00e676")
@@ -738,25 +961,9 @@ if exchange:
             with col_exp_csv:
                 with st.expander("📥 Opțiuni Export CSV (Google Sheets)", expanded=False):
                     if not df_filtrat.empty:
-                        df_csv = df_filtrat.copy()
-                        sum_valoare = df_csv['Valoare'].sum()
-                        sum_pnl = df_csv['PnL'].sum()
-                        sum_comision = df_csv['Comision_Val'].sum() if 'Comision_Val' in df_csv.columns else 0.0
-                        if 'Comision_Val' in df_csv.columns:
-                            df_csv = df_csv.drop(columns=['Comision_Val'])
-                        total_row = pd.DataFrame([{
-                            "Data & Ora": "TOTAL PERIOADĂ",
-                            "Simbol": "",
-                            "Tip": "",
-                            "Preț Execuție": "",
-                            "Cantitate": "",
-                            "Valoare": sum_valoare,
-                            "Execuție": "",
-                            "Comision": sum_comision,
-                            "PnL": sum_pnl
-                        }])
-                        df_csv_final = pd.concat([df_csv, total_row], ignore_index=True)
-                        csv_data = df_csv_final.to_csv(index=False).encode('utf-8')
+                        cols_export = ["Trade_ID", "Rol", "Data & Ora", "Simbol", "Tip", "Preț Execuție", "Cantitate", "Valoare", "Execuție", "Comision", "PnL"]
+                        df_csv = df_filtrat[cols_export].copy()
+                        csv_data = df_csv.to_csv(index=False).encode('utf-8')
                         st.download_button(
                             label=f"📥 Descarcă CSV ({sel_start_date.strftime('%d.%m.%Y')} - {sel_end_date.strftime('%d.%m.%Y')})",
                             data=csv_data,
@@ -767,12 +974,7 @@ if exchange:
                         st.warning("Nu există date în intervalul selectat.")
 
             st.markdown("---")
-            
-            df_display = df_filtrat.copy()
-            if 'Comision_Val' in df_display.columns:
-                df_display = df_display.drop(columns=['Comision_Val'])
-                
-            st.dataframe(color_trade_table(df_display), width="stretch", height=540, hide_index=True)
+            st.markdown(render_boxed_trades_html(df_filtrat), unsafe_allow_html=True)
             
         else:
             st.info("Nu s-au găsit tranzacții închise în istoric.")
