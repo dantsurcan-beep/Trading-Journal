@@ -1,1 +1,0 @@
-CreateObject("Wscript.Shell").Run chr(34) & "G:\Contul meu Drive\TRADING\Trading Journal\Pornire_Jurnal.bat" & chr(34), 0, False
