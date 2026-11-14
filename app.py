@@ -467,7 +467,6 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                     break
                 trades_raw.extend(batch)
 
-                # Luăm ultimul element (cel mai vechi din batch) cu suprapunere de siguranță pt a nu pierde fill-uri din aceeași milisecundă
                 oldest_ts_ms, oldest_iso, newest_ts_ms = None, None, None
                 for item in batch:
                     inf = item.get('info', {}) or {}
@@ -483,7 +482,6 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 if oldest_ts_ms is None or oldest_ts_ms < (since_timestamp - 3 * 86400 * 1000):
                     break
 
-                # Folosim +500ms overlap dacă lotul acoperă mai mult de 1 secundă (unique_trades elimină automat duplicatele)
                 overlap_iso = to_iso_utc(oldest_ts_ms + 500) if (newest_ts_ms and newest_ts_ms > oldest_ts_ms + 1000) else oldest_iso
                 if not overlap_iso or overlap_iso == last_fill_time_param:
                     overlap_iso = oldest_iso if (oldest_iso and oldest_iso != last_fill_time_param) else to_iso_utc(oldest_ts_ms - 1)
@@ -564,7 +562,6 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 "Comision": f"${com_tot:,.4f} ({pct_c:.2f}%)", "PnL_API": safe_float(grup["PnL"].sum())
             })
 
-        # Sortăm cronologic și grupăm pe simbol pentru auto-sincronizarea pozițiilor (Self-Healing Round-Trip)
         aggregated_data.sort(key=lambda x: x["sort_timestamp"])
         by_sym = {}
         for row in aggregated_data:
@@ -580,8 +577,7 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 price = row["Preț Execuție"]
                 ts = row["sort_timestamp"]
 
-                # Dacă avem o poziție deschisă de sens opus, verificăm dacă este o rămășiță veche/desincronizată
-                if pos["qty"] > 1e-9 and pos["side"] != side:
+                if pos["qty"] > 1e-9:
                     same_sums = []
                     acc_s = 0.0
                     idx = i
@@ -600,14 +596,30 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
 
                     tol_pos = max(1e-6, pos["qty"] * 0.005)
                     tol_qty = max(1e-6, qty * 0.005)
-                    matches_pos = any(abs(s_val - pos["qty"]) <= tol_pos for s_val in same_sums)
-                    matches_next_opp = any(abs(o_val - qty) <= tol_qty or abs(o_val - same_sums[-1]) <= max(1e-6, same_sums[-1] * 0.005) for o_val in opp_sums)
 
-                    # Dacă ordinul curent NU corespunde rămășiței vechi, dar formează o pereche exactă cu ordinul următor (sau rămășița e mai veche de 12h), resetăm rămășița
-                    if not matches_pos and (matches_next_opp or (ts - pos["ts"] > 12 * 3600)):
-                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
-                    elif matches_pos and matches_next_opp and (ts - pos["ts"] > 3600) and (i + 1 < n_rows) and (s_rows[i + 1]["sort_timestamp"] - ts < 3600):
-                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                    if pos["side"] != side:
+                        matches_pos = any(abs(s_val - pos["qty"]) <= tol_pos for s_val in same_sums)
+                        matches_next_opp = any(
+                            abs(o_val - qty) <= tol_qty or abs(o_val - same_sums[-1]) <= max(1e-6, same_sums[-1] * 0.005)
+                            for o_val in opp_sums
+                        )
+                        if not matches_pos and (matches_next_opp or (ts - pos["ts"] > 12 * 3600)):
+                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                        elif matches_pos and matches_next_opp and (ts - pos["ts"] > 3600) and (idx < n_rows) and (s_rows[idx]["sort_timestamp"] - ts < 3600):
+                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                    else:
+                        # Aceeași direcție: verificăm dacă ordinul curent formează singur pereche cu închiderea următoare,
+                        # caz în care poziția veche din 'pos' era doar o rămășiță desincronizată.
+                        matches_combined = any(
+                            abs(o_val - (pos["qty"] + s_val)) <= max(1e-6, (pos["qty"] + s_val) * 0.005)
+                            for s_val in same_sums for o_val in opp_sums
+                        )
+                        matches_fresh = any(
+                            abs(o_val - qty) <= tol_qty or abs(o_val - same_sums[-1]) <= max(1e-6, same_sums[-1] * 0.005)
+                            for o_val in opp_sums
+                        )
+                        if not matches_combined and (matches_fresh or (ts - pos["ts"] > 6 * 3600)):
+                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
 
                 calc_pnl = 0.0
                 if pos["qty"] <= 1e-9 or pos["side"] == side:
@@ -737,11 +749,13 @@ if connected_ok:
             total_comision = df_filtrat['Comision_Val'].sum() if ('Comision_Val' in df_filtrat.columns and not df_filtrat.empty) else 0.0
             trades_inchise = df_filtrat[df_filtrat['PnL'] != 0.0] if not df_filtrat.empty else pd.DataFrame()
             nr_inchise = len(trades_inchise)
-            win_rate = (len(trades_inchise[trades_inchise['PnL'] > 0]) / nr_inchise * 100.0) if nr_inchise > 0 else 0.0
+            nr_wins = int(len(trades_inchise[trades_inchise['PnL'] > 0])) if nr_inchise > 0 else 0
+            nr_losses = int(len(trades_inchise[trades_inchise['PnL'] < 0])) if nr_inchise > 0 else 0
+            win_rate = (nr_wins / nr_inchise * 100.0) if nr_inchise > 0 else 0.0
             best_trade = trades_inchise['PnL'].max() if nr_inchise > 0 else 0.0
             worst_trade = trades_inchise['PnL'].min() if nr_inchise > 0 else 0.0
 
-            col_pnl_box, col_kpi_table = st.columns([1.3, 3.2])
+            col_pnl_box, col_kpi_table = st.columns([1.2, 3.3])
             with col_pnl_box:
                 bg_c = "rgba(40, 167, 69, 0.15)" if total_pnl >= 0 else "rgba(255, 51, 51, 0.15)"
                 tx_c = "#00e676" if total_pnl >= 0 else "#ff3333"
@@ -765,17 +779,25 @@ if connected_ok:
                         return "<span style='color:#6c757d;white-space:nowrap;'>$0.00</span>"
                     return v
 
+                wl_html = (
+                    f"<span style='color:#00e676;white-space:nowrap;'>{nr_wins} W</span>"
+                    f" <span style='color:#888;'>/</span> "
+                    f"<span style='color:#ff3333;white-space:nowrap;'>{nr_losses} L</span>"
+                )
+
                 st.markdown(f"""
                 <table style="width:100%;text-align:center;border-collapse:collapse;font-size:0.92rem;">
                     <tr>
                         <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Tranzacții Complete</th>
+                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Win / Loss</th>
                         <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Win Rate</th>
                         <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Comision Perioadă</th>
                         <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Cel mai bun Trade</th>
                         <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Cel mai slab Trade</th>
                     </tr>
                     <tr>
-                        <td style="padding:8px;font-weight:bold;">{c_val(f'{nr_inchise} / {len(df_filtrat)}', False, True)}</td>
+                        <td style="padding:8px;font-weight:bold;">{c_val(f'{nr_inchise}', False, True)}</td>
+                        <td style="padding:8px;font-weight:bold;white-space:nowrap;">{wl_html}</td>
                         <td style="padding:8px;font-weight:bold;">{c_val(f'{win_rate:.1f}%', False, True)}</td>
                         <td style="padding:8px;font-weight:bold;color:#ff8c94;white-space:nowrap;">${total_comision:,.2f}</td>
                         <td style="padding:8px;font-weight:bold;">{c_val(best_trade)}</td>
