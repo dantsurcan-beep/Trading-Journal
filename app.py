@@ -445,7 +445,7 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
         trades_raw = []
         if piata == "Futures":
             last_fill_time_param = None
-            for _ in range(60):
+            for _ in range(70):
                 params = {'lastFillTime': last_fill_time_param} if last_fill_time_param else {}
                 batch = []
                 try:
@@ -466,18 +466,28 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 if not batch:
                     break
                 trades_raw.extend(batch)
-                oldest_ts_ms, oldest_iso = None, None
+
+                # Luăm ultimul element (cel mai vechi din batch) cu suprapunere de siguranță pt a nu pierde fill-uri din aceeași milisecundă
+                oldest_ts_ms, oldest_iso, newest_ts_ms = None, None, None
                 for item in batch:
                     inf = item.get('info', {}) or {}
                     raw_t = inf.get('fillTime') or item.get('timestamp') or inf.get('time')
                     ts_ms = get_ts_ms(raw_t)
-                    if ts_ms > 0 and (oldest_ts_ms is None or ts_ms < oldest_ts_ms):
-                        oldest_ts_ms = ts_ms
-                        oldest_iso = inf.get('fillTime') if isinstance(inf.get('fillTime'), str) else to_iso_utc(ts_ms)
-                if oldest_ts_ms is None or oldest_ts_ms < (since_timestamp - 2 * 86400 * 1000):
+                    if ts_ms > 0:
+                        if newest_ts_ms is None or ts_ms > newest_ts_ms:
+                            newest_ts_ms = ts_ms
+                        if oldest_ts_ms is None or ts_ms <= oldest_ts_ms:
+                            oldest_ts_ms = ts_ms
+                            oldest_iso = inf.get('fillTime') if isinstance(inf.get('fillTime'), str) else to_iso_utc(ts_ms)
+
+                if oldest_ts_ms is None or oldest_ts_ms < (since_timestamp - 3 * 86400 * 1000):
                     break
-                next_p = oldest_iso or to_iso_utc(oldest_ts_ms - 1)
-                last_fill_time_param = to_iso_utc(oldest_ts_ms - 1) if next_p == last_fill_time_param else next_p
+
+                # Folosim +500ms overlap dacă lotul acoperă mai mult de 1 secundă (unique_trades elimină automat duplicatele)
+                overlap_iso = to_iso_utc(oldest_ts_ms + 500) if (newest_ts_ms and newest_ts_ms > oldest_ts_ms + 1000) else oldest_iso
+                if not overlap_iso or overlap_iso == last_fill_time_param:
+                    overlap_iso = oldest_iso if (oldest_iso and oldest_iso != last_fill_time_param) else to_iso_utc(oldest_ts_ms - 1)
+                last_fill_time_param = overlap_iso
         else:
             curr_since = since_timestamp
             for _ in range(20):
@@ -514,7 +524,11 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 exec_det = "STOP LOSS"
             elif 'take' in tot_text or 'profit' in tot_text or 'target' in tot_text:
                 exec_det = "TAKE PROFIT"
-            elif 'limit' in tot_text or 'lmt' in tot_text or 'post' in tot_text or 'maker' in fill_type:
+            elif 'maker' in fill_type or 'post' in tot_text:
+                exec_det = "SELL LIMIT" if raw_side == "sell" else "BUY LIMIT"
+            elif 'taker' in fill_type or 'market' in tot_text or 'mkt' in tot_text or 'ioc' in tot_text:
+                exec_det = "MANUAL"
+            elif 'limit' in tot_text or 'lmt' in tot_text:
                 exec_det = "SELL LIMIT" if raw_side == "sell" else "BUY LIMIT"
             else:
                 exec_det = "MANUAL"
@@ -550,27 +564,70 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 "Comision": f"${com_tot:,.4f} ({pct_c:.2f}%)", "PnL_API": safe_float(grup["PnL"].sum())
             })
 
+        # Sortăm cronologic și grupăm pe simbol pentru auto-sincronizarea pozițiilor (Self-Healing Round-Trip)
         aggregated_data.sort(key=lambda x: x["sort_timestamp"])
-        open_positions = {}
+        by_sym = {}
         for row in aggregated_data:
-            sym, side, qty, price = row["Simbol"], row["Tip"], row["Cantitate"], row["Preț Execuție"]
-            pos = open_positions.get(sym, {"side": None, "qty": 0.0, "price": 0.0})
-            calc_pnl = 0.0
-            if pos["qty"] <= 1e-9 or pos["side"] == side:
-                new_q = pos["qty"] + qty
-                open_positions[sym] = {"side": side, "qty": new_q, "price": ((pos["qty"] * pos["price"]) + (qty * price)) / new_q if new_q > 0 else price}
-            else:
-                closed_q = min(pos["qty"], qty)
-                calc_pnl = (price - pos["price"]) * closed_q if pos["side"] == "LONG" else (pos["price"] - price) * closed_q
-                rem_p, rem_o = pos["qty"] - closed_q, qty - closed_q
-                if rem_p > 1e-9:
-                    open_positions[sym] = {"side": pos["side"], "qty": rem_p, "price": pos["price"]}
-                elif rem_o > 1e-9:
-                    open_positions[sym] = {"side": side, "qty": rem_o, "price": price}
+            by_sym.setdefault(row["Simbol"], []).append(row)
+
+        for sym, s_rows in by_sym.items():
+            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+            n_rows = len(s_rows)
+
+            for i, row in enumerate(s_rows):
+                side = row["Tip"]
+                qty = row["Cantitate"]
+                price = row["Preț Execuție"]
+                ts = row["sort_timestamp"]
+
+                # Dacă avem o poziție deschisă de sens opus, verificăm dacă este o rămășiță veche/desincronizată
+                if pos["qty"] > 1e-9 and pos["side"] != side:
+                    same_sums = []
+                    acc_s = 0.0
+                    idx = i
+                    while idx < n_rows and s_rows[idx]["Tip"] == side:
+                        acc_s += s_rows[idx]["Cantitate"]
+                        same_sums.append(acc_s)
+                        idx += 1
+
+                    opp_sums = []
+                    acc_o = 0.0
+                    idx_o = idx
+                    while idx_o < n_rows and s_rows[idx_o]["Tip"] != side:
+                        acc_o += s_rows[idx_o]["Cantitate"]
+                        opp_sums.append(acc_o)
+                        idx_o += 1
+
+                    tol_pos = max(1e-6, pos["qty"] * 0.005)
+                    tol_qty = max(1e-6, qty * 0.005)
+                    matches_pos = any(abs(s_val - pos["qty"]) <= tol_pos for s_val in same_sums)
+                    matches_next_opp = any(abs(o_val - qty) <= tol_qty or abs(o_val - same_sums[-1]) <= max(1e-6, same_sums[-1] * 0.005) for o_val in opp_sums)
+
+                    # Dacă ordinul curent NU corespunde rămășiței vechi, dar formează o pereche exactă cu ordinul următor (sau rămășița e mai veche de 12h), resetăm rămășița
+                    if not matches_pos and (matches_next_opp or (ts - pos["ts"] > 12 * 3600)):
+                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                    elif matches_pos and matches_next_opp and (ts - pos["ts"] > 3600) and (i + 1 < n_rows) and (s_rows[i + 1]["sort_timestamp"] - ts < 3600):
+                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+
+                calc_pnl = 0.0
+                if pos["qty"] <= 1e-9 or pos["side"] == side:
+                    new_q = pos["qty"] + qty
+                    new_p = ((pos["qty"] * pos["price"]) + (qty * price)) / new_q if new_q > 0 else price
+                    pos = {"side": side, "qty": new_q, "price": new_p, "ts": ts}
                 else:
-                    open_positions[sym] = {"side": None, "qty": 0.0, "price": 0.0}
-            row["PnL"] = row["PnL_API"] if abs(row["PnL_API"]) > 1e-9 else round(calc_pnl, 2)
-            del row["PnL_API"]
+                    closed_q = min(pos["qty"], qty)
+                    calc_pnl = (price - pos["price"]) * closed_q if pos["side"] == "LONG" else (pos["price"] - price) * closed_q
+                    rem_p = pos["qty"] - closed_q
+                    rem_o = qty - closed_q
+                    if rem_p > 1e-9:
+                        pos = {"side": pos["side"], "qty": rem_p, "price": pos["price"], "ts": pos["ts"]}
+                    elif rem_o > 1e-9:
+                        pos = {"side": side, "qty": rem_o, "price": price, "ts": ts}
+                    else:
+                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+
+                row["PnL"] = row["PnL_API"] if abs(row["PnL_API"]) > 1e-9 else round(calc_pnl, 2)
+                del row["PnL_API"]
 
         cutoff_sec = since_timestamp / 1000.0
         aggregated_data = [r for r in aggregated_data if r["sort_timestamp"] >= cutoff_sec]
