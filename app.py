@@ -14,6 +14,12 @@ except ImportError:
 
 st.set_page_config(page_title="Universal Trading Journal (Kraken & Hyperliquid)", layout="wide")
 
+
+def today_ro():
+    """Returnează data curentă exactă după fusul orar al României."""
+    return datetime.now(RO_TZ).date() if RO_TZ else date.today()
+
+
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal_settings.json")
 DEFAULT_SETTINGS = {
     "exchange_ales": "Kraken",
@@ -22,9 +28,10 @@ DEFAULT_SETTINGS = {
     "refresh_interval": 10,
     "hl_wallet": "",
     "start_date": "2026-09-20",
-    "end_date": date.today().strftime("%Y-%m-%d"),
+    "end_date": today_ro().strftime("%Y-%m-%d"),
+    "last_Opened_day": today_ro().strftime("%Y-%m-%d"),
     "directii": ["LONG", "SHORT"],
-    "monede_selectate": []
+    "monede_excluse": []
 }
 
 
@@ -49,12 +56,19 @@ def load_user_settings():
         s["end_date"] = qp["to"]
     if qp.get("hl_w"):
         s["hl_wallet"] = qp["hl_w"]
+
+    # Dacă am trecut într-o zi nouă, avansăm automat 'end_date' la ziua de azi
+    azi_str = today_ro().strftime("%Y-%m-%d")
+    if s.get("last_Opened_day") != azi_str or s.get("end_date", "") < azi_str:
+        s["end_date"] = azi_str
+        s["last_Opened_day"] = azi_str
     return s
 
 
 def save_user_settings(updates):
     cur = load_user_settings()
     cur.update(updates)
+    cur["last_Opened_day"] = today_ro().strftime("%Y-%m-%d")
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(cur, f, indent=2, ensure_ascii=False)
@@ -64,7 +78,7 @@ def save_user_settings(updates):
         st.query_params["exc"] = cur.get("exchange_ales", "Kraken")
         st.query_params["mkt"] = cur.get("piata_ales", "Futures")
         st.query_params["from"] = cur.get("start_date", "2026-09-20")
-        st.query_params["to"] = cur.get("end_date", date.today().strftime("%Y-%m-%d"))
+        st.query_params["to"] = cur.get("end_date", today_ro().strftime("%Y-%m-%d"))
         if cur.get("hl_wallet"):
             st.query_params["hl_w"] = cur["hl_wallet"]
     except Exception:
@@ -355,7 +369,7 @@ def color_active_table(df):
     return styled.format({"Preț Intrare": "${:,.4f}", "Preț Mark (Live)": fmt_p, "Valoare": "${:,.2f}", "Stop Loss": fmt_p, "Take Profit": fmt_p, "Limit": fmt_p, "PnL": fmt_pnl})
 
 
-@st.cache_data(ttl=120, show_spinner="Se descarcă istoricul complet (începând din 20 septembrie)...")
+@st.cache_data(ttl=60, show_spinner="Se descarcă istoricul complet (începând din 20 septembrie)...")
 def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
     since_timestamp = int(datetime(2026, 9, 20, 0, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
@@ -608,8 +622,6 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                         elif matches_pos and matches_next_opp and (ts - pos["ts"] > 3600) and (idx < n_rows) and (s_rows[idx]["sort_timestamp"] - ts < 3600):
                             pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
                     else:
-                        # Aceeași direcție: verificăm dacă ordinul curent formează singur pereche cu închiderea următoare,
-                        # caz în care poziția veche din 'pos' era doar o rămășiță desincronizată.
                         matches_combined = any(
                             abs(o_val - (pos["qty"] + s_val)) <= max(1e-6, (pos["qty"] + s_val) * 0.005)
                             for s_val in same_sums for o_val in opp_sums
@@ -696,23 +708,29 @@ if connected_ok:
                 fetch_closed_trades_history.clear()
         with cb2:
             if st.button("📅 Reset la Tot Istoricul (20 Sept - Azi)"):
-                save_user_settings({"start_date": "2026-09-20", "end_date": date.today().strftime("%Y-%m-%d"), "monede_selectate": [], "directii": ["LONG", "SHORT"]})
+                save_user_settings({
+                    "start_date": "2026-09-20",
+                    "end_date": today_ro().strftime("%Y-%m-%d"),
+                    "monede_excluse": [],
+                    "directii": ["LONG", "SHORT"]
+                })
                 st.rerun()
 
         df_istoric = fetch_closed_trades_history(exchange_ales, exchange, piata_ales, hl_wallet_input)
         if not df_istoric.empty:
             df_istoric['temp_dt'] = pd.to_datetime(df_istoric['Data & Ora'], format='%d-%m-%Y %H:%M', errors='coerce').dt.date
             min_bound = date(2026, 9, 1)
-            max_bound = max(date.today(), df_istoric['temp_dt'].dropna().max() or date.today())
+            azi_ro = today_ro()
+            max_bound = max(azi_ro, df_istoric['temp_dt'].dropna().max() or azi_ro)
 
             try:
                 saved_start = datetime.strptime(user_cfg.get("start_date", "2026-09-20"), "%Y-%m-%d").date()
             except Exception:
                 saved_start = date(2026, 9, 20)
             try:
-                saved_end = datetime.strptime(user_cfg.get("end_date", date.today().strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+                saved_end = datetime.strptime(user_cfg.get("end_date", azi_ro.strftime("%Y-%m-%d")), "%Y-%m-%d").date()
             except Exception:
-                saved_end = date.today()
+                saved_end = azi_ro
 
             saved_start = max(min_bound, min(saved_start, max_bound))
             saved_end = max(saved_start, min(saved_end, max_bound))
@@ -724,21 +742,27 @@ if connected_ok:
                 sel_end_date = st.date_input("🗓️ Până la (ZZ/LL/AAAA)", value=saved_end, min_value=min_bound, max_value=max_bound, format="DD/MM/YYYY")
 
             lista_simboluri = sorted(df_istoric['Simbol'].dropna().unique().tolist())
-            saved_coins = [c for c in user_cfg.get("monede_selectate", []) if c in lista_simboluri]
-            sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=saved_coins if saved_coins else lista_simboluri)
+            monede_excluse = user_cfg.get("monede_excluse", [])
+            default_coins = [c for c in lista_simboluri if c not in monede_excluse] or lista_simboluri
+            sel_simboluri = st.multiselect("🪙 Monede", options=lista_simboluri, default=default_coins)
 
             saved_dirs = [d for d in user_cfg.get("directii", ["LONG", "SHORT"]) if d in ["LONG", "SHORT"]]
             sel_directii = st.multiselect("↕️ Direcție", options=["LONG", "SHORT"], default=saved_dirs if saved_dirs else ["LONG", "SHORT"])
 
             new_s_str, new_e_str = sel_start_date.strftime("%Y-%m-%d"), sel_end_date.strftime("%Y-%m-%d")
-            coins_save = [] if set(sel_simboluri) == set(lista_simboluri) else sel_simboluri
+            new_excluse = [c for c in lista_simboluri if c not in sel_simboluri]
             if (
                 new_s_str != user_cfg.get("start_date") or
                 new_e_str != user_cfg.get("end_date") or
-                coins_save != user_cfg.get("monede_selectate", []) or
+                new_excluse != user_cfg.get("monede_excluse", []) or
                 sel_directii != user_cfg.get("directii", ["LONG", "SHORT"])
             ):
-                save_user_settings({"start_date": new_s_str, "end_date": new_e_str, "monede_selectate": coins_save, "directii": sel_directii})
+                save_user_settings({
+                    "start_date": new_s_str,
+                    "end_date": new_e_str,
+                    "monede_excluse": new_excluse,
+                    "directii": sel_directii
+                })
 
             df_filtrat = df_istoric[
                 (df_istoric['temp_dt'] >= sel_start_date) & (df_istoric['temp_dt'] <= sel_end_date) &
