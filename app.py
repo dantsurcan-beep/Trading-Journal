@@ -16,7 +16,6 @@ st.set_page_config(page_title="Universal Trading Journal (Kraken & Hyperliquid)"
 
 
 def today_ro():
-    """Returnează data curentă exactă după fusul orar al României."""
     return datetime.now(RO_TZ).date() if RO_TZ else date.today()
 
 
@@ -57,7 +56,6 @@ def load_user_settings():
     if qp.get("hl_w"):
         s["hl_wallet"] = qp["hl_w"]
 
-    # Dacă am trecut într-o zi nouă, avansăm automat 'end_date' la ziua de azi
     azi_str = today_ro().strftime("%Y-%m-%d")
     if s.get("last_Opened_day") != azi_str or s.get("end_date", "") < azi_str:
         s["end_date"] = azi_str
@@ -182,6 +180,18 @@ def safe_float(val, default=0.0):
         return default if val is None or val == "" else float(val)
     except Exception:
         return default
+
+
+def format_qty_compact(val):
+    """Formatează cantitatea compact pentru a preveni apariția sliderului orizontal."""
+    num = safe_float(val)
+    if num == 0:
+        return "0"
+    if num >= 1000:
+        return f"{num:,.0f}"
+    if num >= 1:
+        return f"{num:,.4f}".rstrip("0").rstrip(".")
+    return f"{num:.6f}".rstrip("0").rstrip(".")
 
 
 def get_ts_ms(raw_ts):
@@ -366,7 +376,10 @@ def color_active_table(df):
     styled = styled.map(lambda _: 'color: #ffa500; font-weight: bold;', subset=['Trailing'])
     fmt_p = lambda v: "-" if safe_float(v) <= 0 else f"${safe_float(v):,.4f}"
     fmt_pnl = lambda v: "$0.00" if safe_float(v) == 0 else f"${safe_float(v):+,.2f}"
-    return styled.format({"Preț Intrare": "${:,.4f}", "Preț Mark (Live)": fmt_p, "Valoare": "${:,.2f}", "Stop Loss": fmt_p, "Take Profit": fmt_p, "Limit": fmt_p, "PnL": fmt_pnl})
+    return styled.format({
+        "Preț Intrare": "${:,.4f}", "Preț Mark (Live)": fmt_p, "Cantitate": format_qty_compact,
+        "Valoare": "${:,.2f}", "Stop Loss": fmt_p, "Take Profit": fmt_p, "Limit": fmt_p, "PnL": fmt_pnl
+    })
 
 
 @st.cache_data(ttl=60, show_spinner="Se descarcă istoricul complet (începând din 20 septembrie)...")
@@ -436,8 +449,34 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                     "Simbol": first_r["Simbol"], "Tip": first_r["Tip"],
                     "Preț Execuție": (v_tot / c_tot) if c_tot > 0 else 0.0, "Cantitate": c_tot, "Valoare": v_tot,
                     "Execuție": first_r["Execuție"], "Comision_Val": com_tot,
-                    "Comision": f"${com_tot:,.4f} ({pct_c:.2f}%)", "PnL": round(safe_float(g["PnL"].sum()), 2)
+                    "Comision": f"${com_tot:,.4f} ({pct_c:.2f}%)", "PnL_Brut": round(safe_float(g["PnL"].sum()), 2)
                 })
+
+            # Calculăm PnL Net (scăzând comisionul de intrare + comisionul de ieșire pe rândul de închidere)
+            agg.sort(key=lambda x: x["sort_timestamp"])
+            hl_open_fee = {}
+            for r in agg:
+                sym = r["Simbol"]
+                st_pos = hl_open_fee.get(sym, {"qty": 0.0, "fee": 0.0})
+                if abs(r["PnL_Brut"]) <= 1e-9:
+                    st_pos["qty"] += r["Cantitate"]
+                    st_pos["fee"] += r["Comision_Val"]
+                    hl_open_fee[sym] = st_pos
+                    r["PnL Net"] = 0.0
+                    r["Pozitie_Dir"] = r["Tip"]
+                else:
+                    if st_pos["qty"] > 1e-9:
+                        ratio = min(1.0, r["Cantitate"] / st_pos["qty"])
+                        ent_fee = st_pos["fee"] * ratio
+                        st_pos["qty"] = max(0.0, st_pos["qty"] - r["Cantitate"])
+                        st_pos["fee"] = max(0.0, st_pos["fee"] - ent_fee)
+                    else:
+                        ent_fee = 0.0
+                    hl_open_fee[sym] = st_pos
+                    r["PnL Net"] = round(r["PnL_Brut"] - ent_fee - r["Comision_Val"], 2)
+                    # Dacă ordinul de închidere este LONG, poziția închisă a fost SHORT (și invers)
+                    r["Pozitie_Dir"] = "SHORT" if r["Tip"] == "LONG" else "LONG"
+
             df_f = pd.DataFrame(agg)
             return df_f.sort_values(by="sort_timestamp", ascending=False).drop(columns=["sort_timestamp"]).reset_index(drop=True)
         except Exception as e:
@@ -582,7 +621,7 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
             by_sym.setdefault(row["Simbol"], []).append(row)
 
         for sym, s_rows in by_sym.items():
-            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0, "fee": 0.0}
             n_rows = len(s_rows)
 
             for i, row in enumerate(s_rows):
@@ -590,6 +629,7 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                 qty = row["Cantitate"]
                 price = row["Preț Execuție"]
                 ts = row["sort_timestamp"]
+                row_fee = row["Comision_Val"]
 
                 if pos["qty"] > 1e-9:
                     same_sums = []
@@ -618,9 +658,9 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                             for o_val in opp_sums
                         )
                         if not matches_pos and (matches_next_opp or (ts - pos["ts"] > 12 * 3600)):
-                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0, "fee": 0.0}
                         elif matches_pos and matches_next_opp and (ts - pos["ts"] > 3600) and (idx < n_rows) and (s_rows[idx]["sort_timestamp"] - ts < 3600):
-                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0, "fee": 0.0}
                     else:
                         matches_combined = any(
                             abs(o_val - (pos["qty"] + s_val)) <= max(1e-6, (pos["qty"] + s_val) * 0.005)
@@ -631,33 +671,49 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
                             for o_val in opp_sums
                         )
                         if not matches_combined and (matches_fresh or (ts - pos["ts"] > 6 * 3600)):
-                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                            pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0, "fee": 0.0}
 
-                calc_pnl = 0.0
                 if pos["qty"] <= 1e-9 or pos["side"] == side:
                     new_q = pos["qty"] + qty
                     new_p = ((pos["qty"] * pos["price"]) + (qty * price)) / new_q if new_q > 0 else price
-                    pos = {"side": side, "qty": new_q, "price": new_p, "ts": ts}
+                    new_f = pos["fee"] + row_fee
+                    pos = {"side": side, "qty": new_q, "price": new_p, "ts": ts, "fee": new_f}
+                    row["PnL_Brut"] = 0.0
+                    row["PnL Net"] = 0.0
+                    row["Pozitie_Dir"] = side
                 else:
                     closed_q = min(pos["qty"], qty)
-                    calc_pnl = (price - pos["price"]) * closed_q if pos["side"] == "LONG" else (pos["price"] - price) * closed_q
+                    closed_side = pos["side"]
+                    calc_pnl = (price - pos["price"]) * closed_q if closed_side == "LONG" else (pos["price"] - price) * closed_q
+                    gross_pnl = row["PnL_API"] if abs(row["PnL_API"]) > 1e-9 else round(calc_pnl, 2)
+
+                    entry_fee_share = pos["fee"] * (closed_q / pos["qty"]) if pos["qty"] > 0 else 0.0
+                    exit_fee_share = row_fee * (closed_q / qty) if qty > 0 else 0.0
+
                     rem_p = pos["qty"] - closed_q
                     rem_o = qty - closed_q
-                    if rem_p > 1e-9:
-                        pos = {"side": pos["side"], "qty": rem_p, "price": pos["price"], "ts": pos["ts"]}
-                    elif rem_o > 1e-9:
-                        pos = {"side": side, "qty": rem_o, "price": price, "ts": ts}
-                    else:
-                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0}
+                    rem_entry_fee = max(0.0, pos["fee"] - entry_fee_share)
+                    rem_exit_fee = max(0.0, row_fee - exit_fee_share)
 
-                row["PnL"] = row["PnL_API"] if abs(row["PnL_API"]) > 1e-9 else round(calc_pnl, 2)
+                    if rem_p > 1e-9:
+                        pos = {"side": pos["side"], "qty": rem_p, "price": pos["price"], "ts": pos["ts"], "fee": rem_entry_fee}
+                    elif rem_o > 1e-9:
+                        pos = {"side": side, "qty": rem_o, "price": price, "ts": ts, "fee": rem_exit_fee}
+                    else:
+                        pos = {"side": None, "qty": 0.0, "price": 0.0, "ts": 0.0, "fee": 0.0}
+
+                    row["PnL_Brut"] = gross_pnl
+                    row["PnL Net"] = round(gross_pnl - entry_fee_share - exit_fee_share, 2)
+                    row["Pozitie_Dir"] = closed_side
+
                 del row["PnL_API"]
 
         cutoff_sec = since_timestamp / 1000.0
         aggregated_data = [r for r in aggregated_data if r["sort_timestamp"] >= cutoff_sec]
         df_final = pd.DataFrame(aggregated_data)
         if not df_final.empty:
-            df_final['PnL'] = pd.to_numeric(df_final['PnL'], errors='coerce').fillna(0.0)
+            df_final['PnL_Brut'] = pd.to_numeric(df_final['PnL_Brut'], errors='coerce').fillna(0.0)
+            df_final['PnL Net'] = pd.to_numeric(df_final['PnL Net'], errors='coerce').fillna(0.0)
             df_final = df_final.sort_values(by="sort_timestamp", ascending=False).drop(columns=["sort_timestamp"]).reset_index(drop=True)
         return df_final
     except Exception as e:
@@ -666,13 +722,17 @@ def fetch_closed_trades_history(platforma, _exc, piata, hl_wallet=""):
 
 
 def color_trade_table(df):
-    if df.empty or 'PnL' not in df.columns:
+    if df.empty or 'PnL Net' not in df.columns:
         return df
-    df_viz = df.drop(columns=['Comision_Val'], errors='ignore').copy()
-    df_viz['PnL'] = pd.to_numeric(df_viz['PnL'], errors='coerce').fillna(0.0)
-    styled = df_viz.style.apply(lambda r: ['background-color: rgba(77, 163, 255, 0.12);'] * len(r) if safe_float(r['PnL']) != 0.0 else [''] * len(r), axis=1)
+    df_viz = df.drop(columns=['Comision_Val', 'PnL_Brut', 'Pozitie_Dir'], errors='ignore').copy()
+    df_viz['PnL Net'] = pd.to_numeric(df_viz['PnL Net'], errors='coerce').fillna(0.0)
+
+    styled = df_viz.style.apply(
+        lambda r: ['background-color: rgba(77, 163, 255, 0.12);'] * len(r) if abs(safe_float(r['PnL Net'])) > 1e-9 else [''] * len(r),
+        axis=1
+    )
     styled = styled.map(lambda v: 'color: #28a745; font-weight: bold;' if v == "LONG" else ('color: #ff3333; font-weight: bold;' if v == "SHORT" else ''), subset=['Tip'])
-    styled = styled.map(lambda v: 'color: #28a745; font-weight: bold; font-size: 1.1em;' if safe_float(v) > 0 else ('color: #ff3333; font-weight: bold; font-size: 1.1em;' if safe_float(v) < 0 else 'color: #6c757d;'), subset=['PnL'])
+    styled = styled.map(lambda v: 'color: #00e676; font-weight: bold; font-size: 1.08em;' if safe_float(v) > 0 else ('color: #ff3333; font-weight: bold; font-size: 1.08em;' if safe_float(v) < 0 else 'color: #6c757d;'), subset=['PnL Net'])
     styled = styled.map(lambda _: 'color: #4da3ff;', subset=['Data & Ora'])
     styled = styled.map(lambda _: 'color: #00e676; font-weight: bold;', subset=['Simbol'])
     styled = styled.map(lambda _: 'color: #ffc107;', subset=['Preț Execuție'])
@@ -680,7 +740,35 @@ def color_trade_table(df):
     styled = styled.map(lambda _: 'color: #20c997;', subset=['Valoare'])
     styled = styled.map(lambda _: 'color: #ffa500; font-weight: bold;', subset=['Execuție'])
     styled = styled.map(lambda _: 'color: #ff8c94;', subset=['Comision'])
-    return styled.format({"Preț Execuție": "${:,.4f}", "Valoare": "${:,.2f}", "PnL": lambda v: "$0.00" if safe_float(v) == 0 else f"${safe_float(v):+,.2f}"})
+    return styled.format({
+        "Preț Execuție": "${:,.4f}",
+        "Cantitate": format_qty_compact,
+        "Valoare": "${:,.2f}",
+        "PnL Net": lambda v: "$0.00" if abs(safe_float(v)) < 1e-9 else f"${safe_float(v):+,.2f}"
+    })
+
+
+def color_coin_summary_table(df_coins):
+    if df_coins.empty:
+        return df_coins
+    styled = df_coins.style.map(lambda _: 'color: #00e676; font-weight: bold;', subset=['Monedă'])
+    styled = styled.map(lambda _: 'color: #ffc107; font-weight: bold;', subset=['Tranzacții', 'Win Rate Net'])
+    styled = styled.map(lambda _: 'color: #ff8c94;', subset=['Comision Total'])
+    for col in ['PnL Net SHORT', 'PnL Net LONG', 'PnL Brut', 'PnL Net Final']:
+        if col in df_coins.columns:
+            styled = styled.map(
+                lambda v: 'color: #00e676; font-weight: bold;' if safe_float(v) > 0 else ('color: #ff3333; font-weight: bold;' if safe_float(v) < 0 else 'color: #6c757d;'),
+                subset=[col]
+            )
+    fmt_c = lambda v: "$0.00" if abs(safe_float(v)) < 1e-9 else f"${safe_float(v):+,.2f}"
+    return styled.format({
+        "Win Rate Net": "{:.1f}%",
+        "PnL Net SHORT": fmt_c,
+        "PnL Net LONG": fmt_c,
+        "PnL Brut": fmt_c,
+        "Comision Total": "-${:,.2f}",
+        "PnL Net Final": fmt_c
+    })
 
 
 if connected_ok:
@@ -769,25 +857,34 @@ if connected_ok:
                 (df_istoric['Simbol'].isin(sel_simboluri)) & (df_istoric['Tip'].isin(sel_directii))
             ].copy().drop(columns=['temp_dt'])
 
-            total_pnl = df_filtrat['PnL'].sum() if not df_filtrat.empty else 0.0
+            total_pnl_brut = df_filtrat['PnL_Brut'].sum() if ('PnL_Brut' in df_filtrat.columns and not df_filtrat.empty) else 0.0
             total_comision = df_filtrat['Comision_Val'].sum() if ('Comision_Val' in df_filtrat.columns and not df_filtrat.empty) else 0.0
-            trades_inchise = df_filtrat[df_filtrat['PnL'] != 0.0] if not df_filtrat.empty else pd.DataFrame()
-            nr_inchise = len(trades_inchise)
-            nr_wins = int(len(trades_inchise[trades_inchise['PnL'] > 0])) if nr_inchise > 0 else 0
-            nr_losses = int(len(trades_inchise[trades_inchise['PnL'] < 0])) if nr_inchise > 0 else 0
-            win_rate = (nr_wins / nr_inchise * 100.0) if nr_inchise > 0 else 0.0
-            best_trade = trades_inchise['PnL'].max() if nr_inchise > 0 else 0.0
-            worst_trade = trades_inchise['PnL'].min() if nr_inchise > 0 else 0.0
+            total_pnl_net = total_pnl_brut - total_comision
 
-            col_pnl_box, col_kpi_table = st.columns([1.2, 3.3])
+            trades_inchise = df_filtrat[(df_filtrat['PnL_Brut'].abs() > 1e-9) | (df_filtrat['PnL Net'].abs() > 1e-9)] if not df_filtrat.empty else pd.DataFrame()
+            nr_inchise = len(trades_inchise)
+            nr_wins_net = int(len(trades_inchise[trades_inchise['PnL Net'] > 0])) if nr_inchise > 0 else 0
+            nr_losses_net = int(len(trades_inchise[trades_inchise['PnL Net'] <= 0])) if nr_inchise > 0 else 0
+            win_rate_net = (nr_wins_net / nr_inchise * 100.0) if nr_inchise > 0 else 0.0
+            best_trade_net = trades_inchise['PnL Net'].max() if nr_inchise > 0 else 0.0
+            worst_trade_net = trades_inchise['PnL Net'].min() if nr_inchise > 0 else 0.0
+
+            col_pnl_box, col_kpi_table = st.columns([1.35, 3.15])
             with col_pnl_box:
-                bg_c = "rgba(40, 167, 69, 0.15)" if total_pnl >= 0 else "rgba(255, 51, 51, 0.15)"
-                tx_c = "#00e676" if total_pnl >= 0 else "#ff3333"
-                sgn = "+" if total_pnl >= 0 else ""
+                bg_c = "rgba(40, 167, 69, 0.15)" if total_pnl_net >= 0 else "rgba(255, 51, 51, 0.15)"
+                tx_c = "#00e676" if total_pnl_net >= 0 else "#ff3333"
+                sgn_net = "+" if total_pnl_net >= 0 else "-"
+                sgn_brut = "+" if total_pnl_brut >= 0 else "-"
+                brut_c = "#00e676" if total_pnl_brut >= 0 else "#ff3333"
+
                 st.markdown(f"""
-                <div style="background-color:{bg_c};border:1px solid {tx_c};border-radius:8px;padding:12px;text-align:center;">
-                    <h3 style="margin:0;color:#fff;font-size:1.05rem;">PnL Total Cumulat</h3>
-                    <h2 style="margin:4px 0 0 0;color:{tx_c};font-size:1.85rem;white-space:nowrap;">{sgn}${total_pnl:,.2f}</h2>
+                <div style="background-color:{bg_c};border:1px solid {tx_c};border-radius:8px;padding:10px 12px;text-align:center;">
+                    <h3 style="margin:0;color:#fff;font-size:1.02rem;">PnL Net Cumulat (După Comision)</h3>
+                    <h2 style="margin:3px 0 4px 0;color:{tx_c};font-size:1.85rem;white-space:nowrap;">{sgn_net}${abs(total_pnl_net):,.2f}</h2>
+                    <div style="font-size:0.82rem;color:#ccc;border-top:1px solid rgba(255,255,255,0.15);padding-top:4px;">
+                        PnL Brut: <span style="color:{brut_c};font-weight:bold;">{sgn_brut}${abs(total_pnl_brut):,.2f}</span> &nbsp;|&nbsp;
+                        Comisioane: <span style="color:#ff8c94;font-weight:bold;">-${total_comision:,.2f}</span>
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -804,51 +901,91 @@ if connected_ok:
                     return v
 
                 wl_html = (
-                    f"<span style='color:#00e676;white-space:nowrap;'>{nr_wins} W</span>"
+                    f"<span style='color:#00e676;white-space:nowrap;'>{nr_wins_net} W</span>"
                     f" <span style='color:#888;'>/</span> "
-                    f"<span style='color:#ff3333;white-space:nowrap;'>{nr_losses} L</span>"
+                    f"<span style='color:#ff3333;white-space:nowrap;'>{nr_losses_net} L</span>"
                 )
 
                 st.markdown(f"""
-                <table style="width:100%;text-align:center;border-collapse:collapse;font-size:0.92rem;">
+                <table style="width:100%;text-align:center;border-collapse:collapse;font-size:0.9rem;margin-top:4px;">
                     <tr>
                         <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Tranzacții Complete</th>
-                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Win / Loss</th>
-                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Win Rate</th>
-                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Comision Perioadă</th>
-                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Cel mai bun Trade</th>
-                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Cel mai slab Trade</th>
+                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Win / Loss (Net)</th>
+                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Win Rate Net</th>
+                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">PnL Brut</th>
+                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Cel mai bun (Net)</th>
+                        <th style="padding:6px;border-bottom:1px solid #444;color:#aaa;">Cel mai slab (Net)</th>
                     </tr>
                     <tr>
                         <td style="padding:8px;font-weight:bold;">{c_val(f'{nr_inchise}', False, True)}</td>
                         <td style="padding:8px;font-weight:bold;white-space:nowrap;">{wl_html}</td>
-                        <td style="padding:8px;font-weight:bold;">{c_val(f'{win_rate:.1f}%', False, True)}</td>
-                        <td style="padding:8px;font-weight:bold;color:#ff8c94;white-space:nowrap;">${total_comision:,.2f}</td>
-                        <td style="padding:8px;font-weight:bold;">{c_val(best_trade)}</td>
-                        <td style="padding:8px;font-weight:bold;">{c_val(worst_trade)}</td>
+                        <td style="padding:8px;font-weight:bold;">{c_val(f'{win_rate_net:.1f}%', False, True)}</td>
+                        <td style="padding:8px;font-weight:bold;">{c_val(total_pnl_brut)}</td>
+                        <td style="padding:8px;font-weight:bold;">{c_val(best_trade_net)}</td>
+                        <td style="padding:8px;font-weight:bold;">{c_val(worst_trade_net)}</td>
                     </tr>
                 </table>
                 """, unsafe_allow_html=True)
 
+            # === TABEL PERFORMANȚĂ DEFALCATĂ PE MONEDE (PE TOATĂ LĂȚIMEA) ===
+            with st.expander("🪙 Performanță Defalcată pe Monede (PnL Net, Win Rate, SHORT vs. LONG)", expanded=False):
+                if not df_filtrat.empty:
+                    coin_rows = []
+                    for sym, g_sym in df_filtrat.groupby("Simbol"):
+                        closed_sym = g_sym[(g_sym['PnL_Brut'].abs() > 1e-9) | (g_sym['PnL Net'].abs() > 1e-9)]
+                        n_tr = len(closed_sym)
+                        w_net = int(len(closed_sym[closed_sym['PnL Net'] > 0]))
+                        l_net = int(len(closed_sym[closed_sym['PnL Net'] <= 0]))
+                        wr_net = (w_net / n_tr * 100.0) if n_tr > 0 else 0.0
+
+                        pnl_short_net = closed_sym[closed_sym['Pozitie_Dir'] == 'SHORT']['PnL Net'].sum() if 'Pozitie_Dir' in closed_sym.columns else 0.0
+                        pnl_long_net = closed_sym[closed_sym['Pozitie_Dir'] == 'LONG']['PnL Net'].sum() if 'Pozitie_Dir' in closed_sym.columns else 0.0
+
+                        brut_s = safe_float(g_sym['PnL_Brut'].sum())
+                        com_s = safe_float(g_sym['Comision_Val'].sum())
+                        net_s = brut_s - com_s
+
+                        coin_rows.append({
+                            "Monedă": sym,
+                            "Tranzacții": n_tr,
+                            "Win / Loss (Net)": f"{w_net} W / {l_net} L",
+                            "Win Rate Net": wr_net,
+                            "PnL Net SHORT": pnl_short_net,
+                            "PnL Net LONG": pnl_long_net,
+                            "PnL Brut": brut_s,
+                            "Comision Total": com_s,
+                            "PnL Net Final": net_s
+                        })
+                    df_coins = pd.DataFrame(coin_rows).sort_values(by="PnL Net Final", ascending=False).reset_index(drop=True)
+                    st.dataframe(color_coin_summary_table(df_coins), width="stretch", hide_index=True)
+                else:
+                    st.info("Nu există date pentru perioada selectată.")
+
             col_exp_chart, col_exp_csv = st.columns(2)
             with col_exp_chart:
-                with st.expander("📈 Grafic Evoluție PnL Cumulat (Equity Curve)", expanded=False):
+                with st.expander("📈 Grafic Evoluție PnL Net vs. Brut (Equity Curve)", expanded=False):
                     if not trades_inchise.empty:
                         df_chart = trades_inchise.iloc[::-1].copy()
                         df_chart['Timp_Fix'] = pd.to_datetime(df_chart['Data & Ora'], format='%d-%m-%Y %H:%M')
-                        df_chart['PnL Cumulat ($)'] = df_chart['PnL'].cumsum()
-                        st.line_chart(df_chart, x='Timp_Fix', y='PnL Cumulat ($)', color="#00e676")
+                        df_chart['PnL Net Cumulat ($)'] = df_chart['PnL Net'].cumsum()
+                        df_chart['PnL Brut Cumulat ($)'] = df_chart['PnL_Brut'].cumsum()
+                        st.line_chart(
+                            df_chart,
+                            x='Timp_Fix',
+                            y=['PnL Net Cumulat ($)', 'PnL Brut Cumulat ($)'],
+                            color=["#00e676", "#4da3ff"]
+                        )
                     else:
                         st.info("Nu există tranzacții închise în intervalul selectat.")
 
             with col_exp_csv:
                 with st.expander("📥 Opțiuni Export CSV (Google Sheets)", expanded=False):
                     if not df_filtrat.empty:
-                        df_csv = df_filtrat.drop(columns=['Comision_Val'], errors='ignore').copy()
+                        df_csv = df_filtrat.drop(columns=['Comision_Val', 'Pozitie_Dir'], errors='ignore').copy()
                         total_row = pd.DataFrame([{
                             "Data & Ora": "TOTAL PERIOADĂ", "Simbol": "", "Tip": "", "Preț Execuție": "",
                             "Cantitate": "", "Valoare": df_filtrat['Valoare'].sum(), "Execuție": "",
-                            "Comision": total_comision, "PnL": total_pnl
+                            "Comision": total_comision, "PnL_Brut": total_pnl_brut, "PnL Net": total_pnl_net
                         }])
                         csv_data = pd.concat([df_csv, total_row], ignore_index=True).to_csv(index=False).encode('utf-8')
                         st.download_button(
